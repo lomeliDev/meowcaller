@@ -93,7 +93,21 @@ func (e *engine) maybeStartMedia(callID string) {
 	}
 	selfLID, peerLID := m.selfLID, m.peerLID
 	inbound := m.direction == CallDirectionIncoming
+	isGroup := m.group
 	e.mu.Unlock()
+
+	if !isGroup && e.c != nil && e.c.mediaOffload != nil {
+		setup := mediaSetupFrom(callID, callKey, selfLID, peerLID, rd, inbound)
+		offload := e.c.mediaOffload
+		e.c.log.Info().Str("call_id", callID).Msg("handing media to an offload target")
+		go func() {
+			defer clear(callKey)
+			if err := offload(setup); err != nil {
+				e.c.log.Warn().Err(err).Str("call_id", callID).Msg("media offload failed")
+			}
+		}()
+		return
+	}
 
 	if call != nil {
 		call.setPhase(CallPhaseConnecting)

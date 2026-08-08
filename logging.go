@@ -10,8 +10,9 @@ import (
 type Option func(*config)
 
 type config struct {
-	log  zerolog.Logger
-	diag *diag.Recorder
+	log          zerolog.Logger
+	diag         *diag.Recorder
+	mediaOffload MediaOffloadFunc
 }
 
 func resolveConfig(opts []Option) config {
