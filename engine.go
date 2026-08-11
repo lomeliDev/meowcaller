@@ -1712,6 +1712,13 @@ func parseCallTarget(target string) (types.JID, error) {
 		if err != nil {
 			return types.EmptyJID, fmt.Errorf("parse target JID %q: %w", target, err)
 		}
+		// c.us is the legacy phone-number spelling still commonly used by
+		// integrations. Call signaling resolves phone peers through the modern
+		// s.whatsapp.net namespace, so normalize the alias before resolving the
+		// target and building the call offer.
+		if jid.Server == types.LegacyUserServer {
+			jid.Server = types.DefaultUserServer
+		}
 		return jid, nil
 	}
 	return types.NewJID(strings.TrimPrefix(target, "+"), types.DefaultUserServer), nil
