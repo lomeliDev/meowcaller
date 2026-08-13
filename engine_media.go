@@ -239,6 +239,21 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		return err
 	}
 	defer ch.Close()
+
+	// The receive loop below blocks in ch.Recv (a DataChannel Read) and only checks the
+	// context between packets. Once the call ends, the relay goes quiet and no packet
+	// ever arrives to wake it: the goroutine leaked until process exit. Closing the
+	// channel is the only thing that unblocks Recv, so a watcher does exactly that when
+	// the context is canceled; watchDone keeps the watcher itself from outliving us.
+	watchDone := make(chan struct{})
+	defer close(watchDone)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = ch.Close()
+		case <-watchDone:
+		}
+	}()
 	allocateState := newGroupRelayAllocateStateWithHBHFEC(
 		allocate,
 		rd.relayKeyASCII,
