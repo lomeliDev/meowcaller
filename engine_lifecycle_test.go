@@ -595,19 +595,12 @@ func TestRejectFromOwnHostedDeviceIsIgnored(t *testing.T) {
 	}
 }
 
-// A server error on our own ACCEPT that names a SIBLING device of our account
-// (a coexistence/Cloud API bridge failing) must NOT end the call: our accept
-// succeeded. Measured in the decrypted WSS, WhatsApp Web ignores exactly this
-// error="500" and the call runs a full 7.8s. An error naming OUR OWN device
-// stays fatal.
-func TestAcceptAckSiblingDeviceErrorDoesNotEndCall(t *testing.T) {
-	eng, call := testEngineWithOutgoingCall()
-	ownLID := types.JID{User: "27784546091132", Device: 4, Server: types.HiddenUserServer}
-	eng.c.wa = &whatsmeow.Client{Store: &store.Device{LID: ownLID}}
-	var reason string
-	call.OnEnd(func(r string) { reason = r })
-
-	// The jid arrives as a raw string, exactly as captured on the wire.
+// A server error on our ACCEPT is not fatal, whatever device it names.
+// Measured in the decrypted WSS of a coexistence number: WhatsApp Web receives
+// error="500" on its accept and ignores it — the call then carries media for a
+// full 7.8s. The named device is not a reliable us-vs-sibling signal (after a
+// re-pair the 500 can name our own device), so any accept-ack error is kept.
+func TestAcceptAckErrorDoesNotEndCall(t *testing.T) {
 	acceptErrAck := func(jid string) *waBinary.Node {
 		return &waBinary.Node{
 			Tag:   "ack",
@@ -619,22 +612,34 @@ func TestAcceptAckSiblingDeviceErrorDoesNotEndCall(t *testing.T) {
 		}
 	}
 
-	// Sibling device 5 failing (the exact wire capture): ignored, call survives.
-	eng.onCallAck(acceptErrAck("27784546091132:5@lid"))
-	if got := call.State(); got == CallPhaseEnded || reason != "" {
-		t.Fatalf("sibling accept-ack error ended the call (phase=%d, reason=%q)", got, reason)
+	// The exact wire capture (error names our own re-paired device), a sibling,
+	// and no device at all: none may end the call.
+	for _, jid := range []string{"27784546091132:5@lid", "27784546091132:9@lid", ""} {
+		eng, call := testEngineWithOutgoingCall()
+		var reason string
+		call.OnEnd(func(r string) { reason = r })
+		eng.onCallAck(acceptErrAck(jid))
+		if got := call.State(); got == CallPhaseEnded || reason != "" {
+			t.Fatalf("accept-ack error (jid=%q) ended the call (phase=%d, reason=%q)", jid, got, reason)
+		}
 	}
+}
 
-	// No device named: still not our accept — ignored, call survives.
-	eng.onCallAck(acceptErrAck(""))
-	if got := call.State(); got == CallPhaseEnded || reason != "" {
-		t.Fatalf("deviceless accept-ack error ended the call (phase=%d, reason=%q)", got, reason)
-	}
-
-	// Our OWN device (4) failing: still fatal.
-	eng.onCallAck(acceptErrAck("27784546091132:4@lid"))
+// An error on an OFFER ack (outbound call placement) stays fatal.
+func TestOfferAckErrorEndsCall(t *testing.T) {
+	eng, call := testEngineWithOutgoingCall()
+	var reason string
+	call.OnEnd(func(r string) { reason = r })
+	eng.onCallAck(&waBinary.Node{
+		Tag:   "ack",
+		Attrs: waBinary.Attrs{"class": "call", "type": "offer", "error": "500"},
+		Content: []waBinary.Node{{
+			Tag:   "error",
+			Attrs: waBinary.Attrs{"call-id": "CID"},
+		}},
+	})
 	if got := call.State(); got != CallPhaseEnded || reason != "server:500" {
-		t.Fatalf("own-device accept error state = (%d, %q), want (Ended, server:500)", got, reason)
+		t.Fatalf("offer-ack error state = (%d, %q), want (Ended, server:500)", got, reason)
 	}
 }
 

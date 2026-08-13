@@ -1021,15 +1021,6 @@ func jidAttr(n *waBinary.Node, key string) types.JID {
 	return types.EmptyJID
 }
 
-// isForeignSiblingDevice reports whether jid is another device of OUR OWN
-// account (same LID user) that is not this device. Such a device failing is not
-// our failure.
-func (e *engine) isForeignSiblingDevice(jid types.JID) bool {
-	own := e.ownLID()
-	return own.User != "" && !jid.IsEmpty() &&
-		jid.User == own.User && jid.Device != own.Device
-}
-
 // rlProbe is one relay candidate from a relaylatency probe.
 type rlProbe struct {
 	latency   uint32
@@ -1071,26 +1062,25 @@ func (e *engine) onCallAck(ack *waBinary.Node) {
 			callID = en.AttrGetter().String("call-id")
 			failedDevice = jidAttr(en, "jid")
 		}
-		// A server error on our ACCEPT that names a SIBLING device of our own
-		// account is not fatal: OUR accept succeeded, another device of the
-		// account (a coexistence/Cloud API bridge, a stale companion) just
-		// failed to be brought in. WhatsApp Web ignores it and the call runs.
-		// Measured in the decrypted WSS: an accept ack with error="500" naming a
-		// sibling device (27784546091132:5, ours is :4), followed by transport,
-		// mute_v2, and a full 7.8s call. Killing the call here on that 500 is
-		// exactly why coexistence-enrolled numbers could not answer on a
-		// companion. An empty device means the server did not say which one
-		// failed — still not our accept, so we honor Web's behavior and keep the
-		// call. An error naming OUR OWN device stays fatal.
-		if ack.AttrGetter().String("type") == "accept" &&
-			(failedDevice.IsEmpty() || e.isForeignSiblingDevice(failedDevice)) {
+		// An error on our ACCEPT ack is NOT fatal. On a number enrolled in
+		// coexistence (a Meta-hosted Cloud API bridge lives on the account), the
+		// server acks a companion's accept with error="500" naming a device on
+		// the account that could not be brought into the call. WhatsApp Web
+		// receives the identical error and IGNORES it: measured in the decrypted
+		// WSS, right after the error="500" it sends transport/mute_v2 and the
+		// call carries media for its full 7.8s. Killing our leg here (finishCall
+		// "server:500") is exactly why a coexistence number could not answer on a
+		// companion — and the device named is not even a reliable "us vs sibling"
+		// signal (after a re-pair it can be our own device). Offer-ack errors
+		// (outbound call placement) are a different stanza and stay fatal below.
+		if ack.AttrGetter().String("type") == "accept" {
 			e.c.log.Info().
 				Str("call_id", callID).
 				Str("error_code", errCode).
 				Str("device", failedDevice.String()).
-				Msg("ignoring accept-ack error about a sibling device")
+				Msg("ignoring accept-ack server error")
 			e.c.diag.Emit("meta", map[string]any{
-				"event": "accept_ack_sibling_error_ignored", "call_id": callID,
+				"event": "accept_ack_error_ignored", "call_id": callID,
 				"error_code": errCode, "device": failedDevice.String(),
 			})
 			return
