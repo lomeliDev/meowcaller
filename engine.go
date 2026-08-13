@@ -1005,6 +1005,22 @@ func (e *engine) ownLID() types.JID {
 	return e.c.wa.Store.GetLID()
 }
 
+// jidAttr reads a JID-valued attribute that may arrive already decoded as a
+// types.JID or as a raw string. whatsmeow decodes the jid on events but the
+// jid on a raw <error> child of a call ack comes through as a string, which
+// AttrGetter().OptionalJIDOrEmpty silently turns into the empty JID.
+func jidAttr(n *waBinary.Node, key string) types.JID {
+	switch v := n.Attrs[key].(type) {
+	case types.JID:
+		return v
+	case string:
+		if j, err := types.ParseJID(v); err == nil {
+			return j
+		}
+	}
+	return types.EmptyJID
+}
+
 // isForeignSiblingDevice reports whether jid is another device of OUR OWN
 // account (same LID user) that is not this device. Such a device failing is not
 // our failure.
@@ -1053,17 +1069,21 @@ func (e *engine) onCallAck(ack *waBinary.Node) {
 		var failedDevice types.JID
 		if en := findChild(ack, "error"); en != nil {
 			callID = en.AttrGetter().String("call-id")
-			failedDevice = en.AttrGetter().OptionalJIDOrEmpty("jid")
+			failedDevice = jidAttr(en, "jid")
 		}
 		// A server error on our ACCEPT that names a SIBLING device of our own
 		// account is not fatal: OUR accept succeeded, another device of the
 		// account (a coexistence/Cloud API bridge, a stale companion) just
 		// failed to be brought in. WhatsApp Web ignores it and the call runs.
 		// Measured in the decrypted WSS: an accept ack with error="500" naming a
-		// sibling device, followed by transport, mute_v2, and a full 7.8s call.
-		// Killing the call here on that 500 is exactly why coexistence-enrolled
-		// numbers could not answer on a companion.
-		if ack.AttrGetter().String("type") == "accept" && e.isForeignSiblingDevice(failedDevice) {
+		// sibling device (27784546091132:5, ours is :4), followed by transport,
+		// mute_v2, and a full 7.8s call. Killing the call here on that 500 is
+		// exactly why coexistence-enrolled numbers could not answer on a
+		// companion. An empty device means the server did not say which one
+		// failed — still not our accept, so we honor Web's behavior and keep the
+		// call. An error naming OUR OWN device stays fatal.
+		if ack.AttrGetter().String("type") == "accept" &&
+			(failedDevice.IsEmpty() || e.isForeignSiblingDevice(failedDevice)) {
 			e.c.log.Info().
 				Str("call_id", callID).
 				Str("error_code", errCode).

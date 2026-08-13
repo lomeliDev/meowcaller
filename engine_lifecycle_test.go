@@ -607,28 +607,32 @@ func TestAcceptAckSiblingDeviceErrorDoesNotEndCall(t *testing.T) {
 	var reason string
 	call.OnEnd(func(r string) { reason = r })
 
-	siblingErrAck := func(dev uint16) *waBinary.Node {
+	// The jid arrives as a raw string, exactly as captured on the wire.
+	acceptErrAck := func(jid string) *waBinary.Node {
 		return &waBinary.Node{
 			Tag:   "ack",
 			Attrs: waBinary.Attrs{"class": "call", "type": "accept", "error": "500"},
 			Content: []waBinary.Node{{
-				Tag: "error",
-				Attrs: waBinary.Attrs{
-					"call-id": "CID",
-					"jid":     types.JID{User: "27784546091132", Device: dev, Server: types.HiddenUserServer},
-				},
+				Tag:   "error",
+				Attrs: waBinary.Attrs{"call-id": "CID", "jid": jid},
 			}},
 		}
 	}
 
-	// Sibling device 6 failing: ignored, call survives.
-	eng.onCallAck(siblingErrAck(6))
+	// Sibling device 5 failing (the exact wire capture): ignored, call survives.
+	eng.onCallAck(acceptErrAck("27784546091132:5@lid"))
 	if got := call.State(); got == CallPhaseEnded || reason != "" {
 		t.Fatalf("sibling accept-ack error ended the call (phase=%d, reason=%q)", got, reason)
 	}
 
+	// No device named: still not our accept — ignored, call survives.
+	eng.onCallAck(acceptErrAck(""))
+	if got := call.State(); got == CallPhaseEnded || reason != "" {
+		t.Fatalf("deviceless accept-ack error ended the call (phase=%d, reason=%q)", got, reason)
+	}
+
 	// Our OWN device (4) failing: still fatal.
-	eng.onCallAck(siblingErrAck(4))
+	eng.onCallAck(acceptErrAck("27784546091132:4@lid"))
 	if got := call.State(); got != CallPhaseEnded || reason != "server:500" {
 		t.Fatalf("own-device accept error state = (%d, %q), want (Ended, server:500)", got, reason)
 	}
