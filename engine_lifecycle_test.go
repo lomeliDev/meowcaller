@@ -595,6 +595,45 @@ func TestRejectFromOwnHostedDeviceIsIgnored(t *testing.T) {
 	}
 }
 
+// A server error on our own ACCEPT that names a SIBLING device of our account
+// (a coexistence/Cloud API bridge failing) must NOT end the call: our accept
+// succeeded. Measured in the decrypted WSS, WhatsApp Web ignores exactly this
+// error="500" and the call runs a full 7.8s. An error naming OUR OWN device
+// stays fatal.
+func TestAcceptAckSiblingDeviceErrorDoesNotEndCall(t *testing.T) {
+	eng, call := testEngineWithOutgoingCall()
+	ownLID := types.JID{User: "27784546091132", Device: 4, Server: types.HiddenUserServer}
+	eng.c.wa = &whatsmeow.Client{Store: &store.Device{LID: ownLID}}
+	var reason string
+	call.OnEnd(func(r string) { reason = r })
+
+	siblingErrAck := func(dev uint16) *waBinary.Node {
+		return &waBinary.Node{
+			Tag:   "ack",
+			Attrs: waBinary.Attrs{"class": "call", "type": "accept", "error": "500"},
+			Content: []waBinary.Node{{
+				Tag: "error",
+				Attrs: waBinary.Attrs{
+					"call-id": "CID",
+					"jid":     types.JID{User: "27784546091132", Device: dev, Server: types.HiddenUserServer},
+				},
+			}},
+		}
+	}
+
+	// Sibling device 6 failing: ignored, call survives.
+	eng.onCallAck(siblingErrAck(6))
+	if got := call.State(); got == CallPhaseEnded || reason != "" {
+		t.Fatalf("sibling accept-ack error ended the call (phase=%d, reason=%q)", got, reason)
+	}
+
+	// Our OWN device (4) failing: still fatal.
+	eng.onCallAck(siblingErrAck(4))
+	if got := call.State(); got != CallPhaseEnded || reason != "server:500" {
+		t.Fatalf("own-device accept error state = (%d, %q), want (Ended, server:500)", got, reason)
+	}
+}
+
 func TestFinishCallClosesAttachedAudioDevices(t *testing.T) {
 	source := &lifecycleAudioSource{}
 	sink := &lifecycleAudioSink{}

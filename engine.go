@@ -975,7 +975,7 @@ func (e *engine) onReject(ev *events.CallReject) {
 	if m == nil {
 		return
 	}
-	if own := e.ownLIDUser(); own != "" && ev.From.User == own &&
+	if own := e.ownLID().User; own != "" && ev.From.User == own &&
 		(ev.From.Server == types.HostedLIDServer || ev.From.Server == types.HostedServer) {
 		e.c.log.Info().
 			Str("call_id", ev.CallID).
@@ -996,13 +996,22 @@ func (e *engine) onReject(ev *events.CallReject) {
 	e.finishCall(ev.CallID, "rejected")
 }
 
-// ownLIDUser returns the LID user of the account this engine runs for, or ""
-// when it cannot be known (tests build engines without a whatsmeow client).
-func (e *engine) ownLIDUser() string {
+// ownLID returns the LID JID of the account this engine runs for, or the empty
+// JID when it cannot be known (tests build engines without a whatsmeow client).
+func (e *engine) ownLID() types.JID {
 	if e == nil || e.c == nil || e.c.wa == nil {
-		return ""
+		return types.EmptyJID
 	}
-	return e.c.wa.Store.GetLID().User
+	return e.c.wa.Store.GetLID()
+}
+
+// isForeignSiblingDevice reports whether jid is another device of OUR OWN
+// account (same LID user) that is not this device. Such a device failing is not
+// our failure.
+func (e *engine) isForeignSiblingDevice(jid types.JID) bool {
+	own := e.ownLID()
+	return own.User != "" && !jid.IsEmpty() &&
+		jid.User == own.User && jid.Device != own.Device
 }
 
 // rlProbe is one relay candidate from a relaylatency probe.
@@ -1041,8 +1050,30 @@ func (e *engine) applyVoipSettingsCodec(m *engineCall, node *waBinary.Node, call
 func (e *engine) onCallAck(ack *waBinary.Node) {
 	if errCode := ack.AttrGetter().String("error"); errCode != "" {
 		callID := ""
+		var failedDevice types.JID
 		if en := findChild(ack, "error"); en != nil {
 			callID = en.AttrGetter().String("call-id")
+			failedDevice = en.AttrGetter().OptionalJIDOrEmpty("jid")
+		}
+		// A server error on our ACCEPT that names a SIBLING device of our own
+		// account is not fatal: OUR accept succeeded, another device of the
+		// account (a coexistence/Cloud API bridge, a stale companion) just
+		// failed to be brought in. WhatsApp Web ignores it and the call runs.
+		// Measured in the decrypted WSS: an accept ack with error="500" naming a
+		// sibling device, followed by transport, mute_v2, and a full 7.8s call.
+		// Killing the call here on that 500 is exactly why coexistence-enrolled
+		// numbers could not answer on a companion.
+		if ack.AttrGetter().String("type") == "accept" && e.isForeignSiblingDevice(failedDevice) {
+			e.c.log.Info().
+				Str("call_id", callID).
+				Str("error_code", errCode).
+				Str("device", failedDevice.String()).
+				Msg("ignoring accept-ack error about a sibling device")
+			e.c.diag.Emit("meta", map[string]any{
+				"event": "accept_ack_sibling_error_ignored", "call_id": callID,
+				"error_code": errCode, "device": failedDevice.String(),
+			})
+			return
 		}
 		e.c.log.Warn().Str("call_id", callID).Str("error_code", errCode).Msg("call rejected by server")
 		e.finishCall(callID, "server:"+errCode)
