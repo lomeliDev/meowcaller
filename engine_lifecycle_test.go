@@ -7,7 +7,9 @@ import (
 	"testing"
 
 	"github.com/purpshell/meowcaller/signaling"
+	"go.mau.fi/whatsmeow"
 	waBinary "go.mau.fi/whatsmeow/binary"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 )
@@ -561,6 +563,35 @@ func TestPeerRejectEndsCall(t *testing.T) {
 	}
 	if reason != "rejected" {
 		t.Fatalf("reason = %q, want rejected", reason)
+	}
+}
+
+// A reject from a Meta-hosted sibling device of our own account (Cloud API
+// coexistence, "uncallable") must NOT end the call: it is a bot, not a human
+// declining, and measured live neither the server nor the caller honor it.
+func TestRejectFromOwnHostedDeviceIsIgnored(t *testing.T) {
+	eng, call := testEngineWithOutgoingCall()
+	ownLID := types.JID{User: "27784546091132", Device: 4, Server: types.HiddenUserServer}
+	eng.c.wa = &whatsmeow.Client{Store: &store.Device{LID: ownLID}}
+	var reason string
+	call.OnEnd(func(r string) { reason = r })
+
+	eng.onReject(&events.CallReject{BasicCallMeta: types.BasicCallMeta{
+		CallID: "CID",
+		From:   types.JID{User: "27784546091132", Device: 99, Server: types.HostedLIDServer},
+	}})
+	if got := call.State(); got == CallPhaseEnded || reason != "" {
+		t.Fatalf("hosted sibling reject ended the call (phase=%d, reason=%q)", got, reason)
+	}
+
+	// A REAL sibling device declining (the owner on their phone) still ends it:
+	// that is the rejected-elsewhere path and it must keep working.
+	eng.onReject(&events.CallReject{BasicCallMeta: types.BasicCallMeta{
+		CallID: "CID",
+		From:   types.JID{User: "27784546091132", Device: 1, Server: types.HiddenUserServer},
+	}})
+	if got := call.State(); got != CallPhaseEnded || reason != "rejected" {
+		t.Fatalf("real sibling reject state = (%d, %q), want (Ended, rejected)", got, reason)
 	}
 }
 

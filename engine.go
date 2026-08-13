@@ -959,9 +959,31 @@ func preferQualifiedPeer(current string, signaled types.JID) string {
 }
 
 // onReject tears down an outgoing call when the peer declines it.
+//
+// One exception: a reject coming from a Meta-HOSTED sibling device of our OWN
+// account (server "hosted.lid" — e.g. the Cloud API coexistence companion,
+// platform="capi"). That is a bot declaring itself uncallable
+// (reason="uncallable"), never a human declining. Measured live: neither the
+// WhatsApp server nor the caller honor it — while event processing lagged the
+// reject sat unprocessed and those calls rang, bridged and carried audio just
+// fine — so honoring it here killed perfectly good calls the moment event
+// processing stopped lagging. Rejects from REAL sibling devices (the account
+// owner declining on their phone → rejected-elsewhere) and from the peer keep
+// ending the call exactly as before.
 func (e *engine) onReject(ev *events.CallReject) {
 	m := e.lookup(ev.CallID)
 	if m == nil {
+		return
+	}
+	if own := e.ownLIDUser(); own != "" && ev.From.User == own &&
+		(ev.From.Server == types.HostedLIDServer || ev.From.Server == types.HostedServer) {
+		e.c.log.Info().
+			Str("call_id", ev.CallID).
+			Str("from", ev.From.String()).
+			Msg("ignoring reject from our own hosted device")
+		e.c.diag.Emit("meta", map[string]any{
+			"event": "hosted_reject_ignored", "call_id": ev.CallID, "from": ev.From.String(),
+		})
 		return
 	}
 	e.c.log.Info().
@@ -972,6 +994,15 @@ func (e *engine) onReject(ev *events.CallReject) {
 		"event": "peer_reject", "call_id": ev.CallID, "from": ev.From.String(),
 	})
 	e.finishCall(ev.CallID, "rejected")
+}
+
+// ownLIDUser returns the LID user of the account this engine runs for, or ""
+// when it cannot be known (tests build engines without a whatsmeow client).
+func (e *engine) ownLIDUser() string {
+	if e == nil || e.c == nil || e.c.wa == nil {
+		return ""
+	}
+	return e.c.wa.Store.GetLID().User
 }
 
 // rlProbe is one relay candidate from a relaylatency probe.
