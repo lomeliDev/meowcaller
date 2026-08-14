@@ -7,6 +7,23 @@ All notable changes to meowcaller, tracked per module. Format loosely follows
 
 ## [Unreleased]
 
+### media/relay-fanout — `implemented`
+
+- Bind and allocate on every relay in the offer for 1:1 calls, broadcast
+  outbound packets to all of them, and merge inbound behind an (SSRC, seq)
+  replay filter; the keepalive re-sends each relay its own allocate. Phones
+  run client-side relay election shortly after accept and move their media to
+  the offered relay they measured closest, so a callee bound to a single
+  relay goes deaf 5–8 comfort-noise packets in (#21, #22); web callers never
+  migrate, which is why single-relay binding appeared to work from WhatsApp
+  Web. relaylatency probes are now answered only for relays present in the
+  offer, so the election cannot settle on the caller's own nearest edge — a
+  relay the callee holds no tokens for. Group calls keep the previous
+  single-relay semantics. Live-validated against Android (consumer and
+  Business), iPhone, and web callers; the live relay hop has no KAT vector,
+  matching the validation state of the existing relay code.
+
+
 ### media/group-runtime — `KAT-verified`
 
 - Hardened live group-call teardown by closing and detaching audio endpoints,
