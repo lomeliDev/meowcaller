@@ -4,6 +4,8 @@ import (
 	"errors"
 	"sync"
 
+	"github.com/rs/zerolog"
+
 	"github.com/purpshell/meowcaller/relay"
 )
 
@@ -26,10 +28,12 @@ type relayFanout struct {
 	packets   chan []byte
 	done      chan struct{}
 	closeOnce sync.Once
+	log       zerolog.Logger
 
-	mu     sync.Mutex
-	closed bool
-	live   int
+	mu       sync.Mutex
+	closed   bool
+	live     int
+	oversize uint64
 }
 
 // fanoutBacklog bounds merged inbound packets awaiting Recv. At 60ms audio
@@ -41,7 +45,7 @@ var errFanoutClosed = errors.New("meowcaller: relay fanout closed")
 
 // newRelayFanout takes ownership of the channels and their matching per-relay
 // allocate payloads, and starts one reader per channel.
-func newRelayFanout(chans []*relay.RelayMediaChannel, allocs [][]byte, names []string) *relayFanout {
+func newRelayFanout(chans []*relay.RelayMediaChannel, allocs [][]byte, names []string, log zerolog.Logger) *relayFanout {
 	// Source of truth: https://github.com/JotaDev66/WaCalls/blob/edeb31f0427aba896639db503153b777a405eccf/internal/voip/transport/sctprelay.go#L105-L127
 	f := &relayFanout{
 		chans:   chans,
@@ -49,20 +53,21 @@ func newRelayFanout(chans []*relay.RelayMediaChannel, allocs [][]byte, names []s
 		names:   names,
 		packets: make(chan []byte, fanoutBacklog),
 		done:    make(chan struct{}),
+		log:     log,
 		live:    len(chans),
 	}
-	for _, ch := range chans {
-		go f.readLoop(ch)
+	for i, ch := range chans {
+		go f.readLoop(i, ch)
 	}
 	return f
 }
 
-func (f *relayFanout) readLoop(ch *relay.RelayMediaChannel) {
+func (f *relayFanout) readLoop(idx int, ch *relay.RelayMediaChannel) {
 	buf := make([]byte, 2048)
 	for {
 		n, err := ch.Recv(buf)
 		if err != nil {
-			f.readerExited()
+			f.readerExited(idx, err)
 			return
 		}
 		pkt := make([]byte, n)
@@ -80,13 +85,32 @@ func (f *relayFanout) readLoop(ch *relay.RelayMediaChannel) {
 
 // readerExited closes the fanout once the last relay connection dies, so Recv
 // unblocks with an error instead of waiting on relays that are all gone.
-func (f *relayFanout) readerExited() {
+//
+// A relay dying while others live no longer ends the call — which is the point
+// of binding to all of them — but it MUST be said out loud: if the peer had
+// elected the relay that just died, the call goes mute with every remaining
+// transport healthy, no error anywhere, and Recv blocking forever. That is the
+// exact blindness this fan-out exists to remove, so it does not get to
+// reintroduce it silently.
+func (f *relayFanout) readerExited(idx int, err error) {
 	f.mu.Lock()
 	f.live--
-	last := f.live == 0
+	live, closed := f.live, f.closed
+	name := ""
+	if idx >= 0 && idx < len(f.names) {
+		name = f.names[idx]
+	}
 	f.mu.Unlock()
-	if last {
+	if live == 0 {
+		if !closed {
+			f.log.Warn().Err(err).Str("relay_name", name).Msg("last relay in the fanout died; media ends")
+		}
 		f.Close()
+		return
+	}
+	if !closed {
+		f.log.Warn().Err(err).Str("relay_name", name).Int("live", live).
+			Msg("a relay in the fanout died; if the peer had elected it the call goes mute with the rest healthy")
 	}
 }
 
@@ -124,20 +148,43 @@ func (f *relayFanout) Send(data []byte) (int, error) {
 // Recv pops the next packet from any relay into buf, blocking like the
 // single-channel Recv it replaces.
 func (f *relayFanout) Recv(buf []byte) (int, error) {
-	select {
-	case pkt := <-f.packets:
-		n := copy(buf, pkt)
-		return n, nil
-	case <-f.done:
-		// Drain anything already merged before reporting closure.
+	for {
 		select {
 		case pkt := <-f.packets:
-			n := copy(buf, pkt)
-			return n, nil
-		default:
+			if n, ok := f.copyOut(buf, pkt); ok {
+				return n, nil
+			}
+		case <-f.done:
+			// Drain anything already merged before reporting closure.
+			select {
+			case pkt := <-f.packets:
+				if n, ok := f.copyOut(buf, pkt); ok {
+					return n, nil
+				}
+			default:
+			}
 			return 0, errFanoutClosed
 		}
 	}
+}
+
+// copyOut hands a merged packet to the caller's buffer, dropping (loudly, once)
+// anything that would not fit. Truncating instead would deliver a packet that
+// cannot authenticate, and it would be counted as an SRTP failure — pointing the
+// diagnosis at the keying instead of at the buffer.
+func (f *relayFanout) copyOut(buf, pkt []byte) (int, bool) {
+	if len(pkt) > len(buf) {
+		f.mu.Lock()
+		f.oversize++
+		first := f.oversize == 1
+		f.mu.Unlock()
+		if first {
+			f.log.Warn().Int("packet_bytes", len(pkt)).Int("buffer_bytes", len(buf)).
+				Msg("dropping a relay packet larger than the media loop's buffer")
+		}
+		return 0, false
+	}
+	return copy(buf, pkt), true
 }
 
 // ResendAllocates re-sends each relay its own allocate payload. Allocates embed

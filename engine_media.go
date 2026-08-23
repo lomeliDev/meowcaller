@@ -153,26 +153,50 @@ func (e *engine) connectAndAllocateAll(ctx context.Context, rd *relayData, strea
 		}
 	}
 
+	// Connect every target CONCURRENTLY. Serially, one unreachable relay parks
+	// the whole call for the 12s DTLS timeout before the consent ping — and the
+	// relay bridges nothing until consent, so that is 12s of silence added to a
+	// call that would otherwise have worked, per unreachable relay. The results
+	// are re-ordered afterwards so the preferred endpoint stays first.
+	type dialed struct {
+		ch       *relay.RelayMediaChannel
+		allocate []byte
+		name     string
+	}
+	results := make([]*dialed, len(targets))
+	var wg sync.WaitGroup
+	for i, ep := range targets {
+		wg.Add(1)
+		go func(i int, ep *relayEndpoint) {
+			defer wg.Done()
+			ch, allocate, err := e.connectOneRelay(ctx, rd, ep, streamSsrcs)
+			if err != nil {
+				// Secondary relays failing is survivable; the primary failing
+				// with no fallback is not.
+				e.c.log.Warn().Err(err).Str("relay_name", ep.relayName).Msg("relay connect failed; continuing without it")
+				return
+			}
+			results[i] = &dialed{ch: ch, allocate: allocate, name: ep.relayName}
+		}(i, ep)
+	}
+	wg.Wait()
+
 	var chans []*relay.RelayMediaChannel
 	var allocs [][]byte
 	var names []string
-	for _, ep := range targets {
-		ch, allocate, err := e.connectOneRelay(ctx, rd, ep, streamSsrcs)
-		if err != nil {
-			// Secondary relays failing is survivable; the primary failing with
-			// no fallback is not.
-			e.c.log.Warn().Err(err).Str("relay_name", ep.relayName).Msg("relay connect failed; continuing without it")
+	for _, r := range results {
+		if r == nil {
 			continue
 		}
-		chans = append(chans, ch)
-		allocs = append(allocs, allocate)
-		names = append(names, ep.relayName)
+		chans = append(chans, r.ch)
+		allocs = append(allocs, r.allocate)
+		names = append(names, r.name)
 	}
 	if len(chans) == 0 {
 		return nil, fmt.Errorf("no relay reachable (%d offered)", len(targets))
 	}
 	e.c.log.Info().Int("connected", len(chans)).Int("offered", len(targets)).Strs("relays", names).Msg("relay fanout established")
-	return newRelayFanout(chans, allocs, names), nil
+	return newRelayFanout(chans, allocs, names, e.c.log), nil
 }
 
 // connectOneRelay opens the relay DataChannel and sends the STUN allocate for a
@@ -631,7 +655,11 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 				}
 			}
 			if !allocateSent {
-				if isGroup {
+				// groupMode, not the isGroup snapshot taken at startup: a 1:1
+				// call can be promoted to a group mid-call, and re-sending the
+				// original 1:1 allocate would drop the participant
+				// subscriptions the group path had installed.
+				if groupMode.Load() {
 					if err := allocateState.SendCurrent(func(packet []byte) error {
 						_, sendErr := ch.PrimarySend(packet)
 						return sendErr
