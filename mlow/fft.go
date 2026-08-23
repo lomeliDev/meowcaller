@@ -1,6 +1,9 @@
 package mlow
 
-import "math"
+import (
+	"math"
+	"sync"
+)
 
 // cpx is a single-precision complex value.
 //
@@ -36,6 +39,41 @@ func smallestFactor(n int) int {
 	return n
 }
 
+// twiddleKey identifies a precomputed twiddle table: its length and its direction.
+type twiddleKey struct {
+	n   int
+	inv bool
+}
+
+// twiddleCache memoizes the twiddle tables. The encoder and the decoder only ever
+// ask for the handful of transform lengths the codec is built around (512 for the
+// LPC analysis, 576 for the perceptual model), so the cache holds a couple of
+// entries for the life of the process and never grows with traffic.
+var twiddleCache sync.Map // twiddleKey -> []cpx
+
+// twiddleFactors returns the n-th roots of unity w[t] = e^(sign*i*2*pi*t/n),
+// computed once per (length, direction) and shared afterwards.
+//
+// Every twiddle the mixed-radix recursion needs at a sub-length m that divides n
+// is also an n-th root of unity, so one table of n entries serves every level:
+// e^(sign*i*2*pi*k*q/m) == w[(k*q mod m)*(n/m)]. That is what keeps math.Cos and
+// math.Sin out of the hot path — they used to run once per butterfly.
+func twiddleFactors(n int, sign float32) []cpx {
+	key := twiddleKey{n: n, inv: sign > 0}
+	if v, ok := twiddleCache.Load(key); ok {
+		return v.([]cpx)
+	}
+	w := make([]cpx, n)
+	for t := 0; t < n; t++ {
+		ang := float64(sign) * 2.0 * smplPI * float64(t) / float64(n)
+		w[t] = cpx{re: float32(math.Cos(ang)), im: float32(math.Sin(ang))}
+	}
+	// LoadOrStore, not Store: two goroutines racing on the same length must end up
+	// sharing one table instead of one of them replacing the other's in flight.
+	actual, _ := twiddleCache.LoadOrStore(key, w)
+	return actual.([]cpx)
+}
+
 // fftRec is the recursive mixed-radix Cooley-Tukey DFT. sign is -1 forward, +1
 // inverse (unnormalized). x holds n inputs at the given stride; out is contiguous.
 func fftRec(x []cpx, stride, n int, sign float32, out []cpx) {
@@ -44,15 +82,23 @@ func fftRec(x []cpx, stride, n int, sign float32, out []cpx) {
 		out[0] = x[0]
 		return
 	}
+	fftRecTw(x, stride, n, out, twiddleFactors(n, sign), 1)
+}
+
+// fftRecTw is fftRec with the twiddle table threaded through. tw holds the N-th
+// roots of unity of the top-level transform and step is N/n, so tw[t*step] is the
+// t-th n-th root of unity at this level.
+func fftRecTw(x []cpx, stride, n int, out []cpx, tw []cpx, step int) {
+	if n == 1 {
+		out[0] = x[0]
+		return
+	}
 	p := smallestFactor(n)
 	if p == n {
 		for k := 0; k < n; k++ {
 			var acc cpx
-			angK := sign * 2.0 * smplPI * float32(k) / float32(n)
 			for j := 0; j < n; j++ {
-				ang := angK * float32(j)
-				w := cpx{re: float32(math.Cos(float64(ang))), im: float32(math.Sin(float64(ang)))}
-				acc = acc.add(x[j*stride].mul(w))
+				acc = acc.add(x[j*stride].mul(tw[(k*j%n)*step]))
 			}
 			out[k] = acc
 		}
@@ -61,15 +107,13 @@ func fftRec(x []cpx, stride, n int, sign float32, out []cpx) {
 	m := n / p
 	sub := make([]cpx, n)
 	for q := 0; q < p; q++ {
-		fftRec(x[q*stride:], stride*p, m, sign, sub[q*m:(q+1)*m])
+		fftRecTw(x[q*stride:], stride*p, m, sub[q*m:(q+1)*m], tw, step*p)
 	}
 	for k := 0; k < n; k++ {
 		kmod := k % m
 		var acc cpx
 		for q := 0; q < p; q++ {
-			ang := sign * 2.0 * smplPI * float32(k) * float32(q) / float32(n)
-			tw := cpx{re: float32(math.Cos(float64(ang))), im: float32(math.Sin(float64(ang)))}
-			acc = acc.add(sub[q*m+kmod].mul(tw))
+			acc = acc.add(sub[q*m+kmod].mul(tw[(k*q%n)*step]))
 		}
 		out[k] = acc
 	}
