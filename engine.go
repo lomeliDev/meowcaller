@@ -358,6 +358,13 @@ func (e *engine) setVideoEnabled(callID string, enabled bool) error {
 			sender.disable()
 		}
 	}
+	// A media-only engine (an offloaded call) has no signaling: the session that
+	// handed the media over owns the <video> state stanza. Here the toggle is
+	// local — the sender is the whole point — and it must not roll back as if the
+	// peer had been told and refused.
+	if e.sendCallNode == nil {
+		return nil
+	}
 	state, dec := signaling.VideoStateDisabled, ""
 	if enabled {
 		state, dec = signaling.VideoStateEnabled, signaling.VideoStateDecH264

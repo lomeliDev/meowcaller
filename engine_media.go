@@ -94,10 +94,11 @@ func (e *engine) maybeStartMedia(callID string) {
 	selfLID, peerLID := m.selfLID, m.peerLID
 	inbound := m.direction == CallDirectionIncoming
 	isGroup := m.group
+	video := m.localVideo || m.remoteVideo
 	e.mu.Unlock()
 
 	if !isGroup && e.c != nil && e.c.mediaOffload != nil {
-		setup := mediaSetupFrom(callID, callKey, selfLID, peerLID, rd, inbound)
+		setup := mediaSetupFrom(callID, callKey, selfLID, peerLID, rd, inbound, video)
 		offload := e.c.mediaOffload
 		e.c.log.Info().Str("call_id", callID).Msg("handing media to an offload target")
 		go func() {

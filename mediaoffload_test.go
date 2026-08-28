@@ -188,3 +188,68 @@ func TestGroupCallsIgnoreTheOffload(t *testing.T) {
 		t.Error("a group call was handed to the offload target")
 	}
 }
+
+// TestOffloadedVideoCallStartsWithTheSenderActive guards the one thing the
+// media process cannot learn on its own: that the call was negotiated with
+// video. Without the flag the video sender is born inactive and SendVideo
+// drops every access unit silently — no error, no RTP, a peer that never
+// asks for a keyframe. And the toggle must stay local: an offloaded engine has
+// no signaling, so SetVideoEnabled cannot fail-and-roll-back as if the peer
+// had refused.
+func TestOffloadedVideoCallStartsWithTheSenderActive(t *testing.T) {
+	if got := mediaSetupFrom("call-v", []byte("k"), "self", "peer", sampleRelayData(t), true, true); !got.Video {
+		t.Fatal("mediaSetupFrom dropped the video flag; the worker would never send video")
+	}
+	setup := MediaSetup{
+		CallID:  "call-v",
+		CallKey: []byte("call-key"),
+		PeerJID: "12345678901@s.whatsapp.net",
+		Inbound: true,
+		Video:   true,
+		Relay:   relaySetupFrom(sampleRelayData(t)),
+	}
+	oc, err := NewOffloadedCall(setup)
+	if err != nil {
+		t.Fatalf("usable video setup rejected: %v", err)
+	}
+	if !oc.Call().IsVideo() {
+		t.Fatal("offloaded video call does not report IsVideo")
+	}
+	oc.eng.mu.Lock()
+	m := oc.eng.calls["call-v"]
+	oc.eng.mu.Unlock()
+	if !m.localVideo || !m.remoteVideo {
+		t.Fatalf("video call must start with both directions enabled: local=%v remote=%v", m.localVideo, m.remoteVideo)
+	}
+
+	// The media loop copies localVideo into the sender when it attaches; here
+	// the sender is attached by hand to watch the toggle reach it.
+	vs := &videoSender{}
+	oc.eng.mu.Lock()
+	m.videoTx = vs
+	oc.eng.mu.Unlock()
+
+	if err := oc.Call().SetVideoEnabled(false); err != nil {
+		t.Fatalf("local video toggle failed on an engine without signaling: %v", err)
+	}
+	if m.localVideo || vs.active {
+		t.Error("SetVideoEnabled(false) did not disable the sender locally")
+	}
+	if err := oc.Call().SetVideoEnabled(true); err != nil {
+		t.Fatalf("local video toggle failed on an engine without signaling: %v", err)
+	}
+	if !m.localVideo || !vs.active || vs.sendGated {
+		t.Errorf("SetVideoEnabled(true) rolled back or gated the sender: local=%v active=%v gated=%v", m.localVideo, vs.active, vs.sendGated)
+	}
+
+	audioOnly := setup
+	audioOnly.CallID = "call-a"
+	audioOnly.Video = false
+	oc2, err := NewOffloadedCall(audioOnly)
+	if err != nil {
+		t.Fatalf("usable audio setup rejected: %v", err)
+	}
+	if oc2.Call().IsVideo() {
+		t.Error("audio-only offloaded call reports video")
+	}
+}

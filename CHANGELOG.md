@@ -7,6 +7,19 @@ All notable changes to meowcaller, tracked per module. Format loosely follows
 
 ## [Unreleased]
 
+### media/offload — `implemented`
+
+- `MediaSetup.Video` carries the negotiated video state to the offloaded media
+  process, which marks the call with both video directions enabled (as
+  `onOffer` does in the session) so the video sender is born active. Before,
+  the offloaded engine started every call as audio-only and `SendVideo`
+  dropped each access unit silently: no error, no RTP on the video SSRC, a
+  peer that never asked for a keyframe. `SetVideoEnabled` on an engine without
+  signaling now toggles the sender locally and returns nil instead of
+  transmitting a `<video>` stanza it cannot send and rolling the sender back
+  as if the peer had refused; the session that handed the media over owns the
+  signaling.
+
 ### media/relay-fanout — `implemented`
 
 - Bind and allocate on every relay in the offer for 1:1 calls, broadcast

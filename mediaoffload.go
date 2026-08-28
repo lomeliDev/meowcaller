@@ -17,7 +17,12 @@ type MediaSetup struct {
 	PeerLID string
 	PeerJID string
 	Inbound bool
-	Relay   RelaySetup
+	// Video reports a call negotiated with video in both directions (the
+	// <offer>/<accept> handshake advertised <video>). The media process needs it
+	// because the video send pipeline starts active only when the call has local
+	// video, and a process without signaling has no other way to learn it.
+	Video bool
+	Relay RelaySetup
 }
 
 // RelaySetup is the elected relay's keying and endpoints.
@@ -111,13 +116,14 @@ func (rs RelaySetup) toRelayData(peerJID types.JID) *relayData {
 	return rd
 }
 
-func mediaSetupFrom(callID string, callKey []byte, selfLID, peerLID string, rd *relayData, inbound bool) MediaSetup {
+func mediaSetupFrom(callID string, callKey []byte, selfLID, peerLID string, rd *relayData, inbound, video bool) MediaSetup {
 	s := MediaSetup{
 		CallID:  callID,
 		CallKey: append([]byte(nil), callKey...),
 		SelfLID: selfLID,
 		PeerLID: peerLID,
 		Inbound: inbound,
+		Video:   video,
 		Relay:   relaySetupFrom(rd),
 	}
 	if rd != nil {
@@ -177,14 +183,20 @@ func NewOffloadedCall(setup MediaSetup, opts ...Option) (*OffloadedCall, error) 
 	if setup.Inbound {
 		direction = CallDirectionIncoming
 	}
+	// A video call starts with both directions enabled, exactly as onOffer marks it
+	// in the session: the video sender is born active (engine_media.go copies
+	// localVideo into it) instead of waiting for a signaling round-trip this
+	// process cannot make.
 	e.calls[setup.CallID] = &engineCall{
-		call:      call,
-		callKey:   append([]byte(nil), setup.CallKey...),
-		relay:     setup.Relay.toRelayData(peerJID),
-		selfLID:   setup.SelfLID,
-		peerLID:   setup.PeerLID,
-		direction: direction,
-		started:   true,
+		call:        call,
+		callKey:     append([]byte(nil), setup.CallKey...),
+		relay:       setup.Relay.toRelayData(peerJID),
+		selfLID:     setup.SelfLID,
+		peerLID:     setup.PeerLID,
+		direction:   direction,
+		started:     true,
+		localVideo:  setup.Video,
+		remoteVideo: setup.Video,
 	}
 	return &OffloadedCall{call: call, eng: e, setup: setup}, nil
 }
