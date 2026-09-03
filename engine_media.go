@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -758,7 +759,6 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	}()
 	videoReceiveStates := make(map[*participantAudioReceiver]*videoReceiveState)
 	appDataReceivers := make(map[*participantAudioReceiver]*appDataReceiver)
-	lastVideoPLI := make(map[uint32]time.Time)
 	var rosterGeneration uint64
 	hasRosterGeneration := false
 	var videoWirePacket, videoWireFrame uint64
@@ -779,6 +779,10 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	if err = audioReceivers.attachSRTCPSender(videoRtcp); err != nil {
 		return fmt.Errorf("attach video SRTCP sender: %w", err)
 	}
+	// One keyframe requester per call, shared by the loss-recovery path below and by
+	// Call.RequestVideoKeyframe. Registered on the call so the on-demand caller can
+	// reach it, and detached when this loop exits.
+	videoKeyframes := newVideoKeyframeRequester(videoRtcp, ch, log)
 	vsender := &videoSender{
 		pipe: txVideoPipe, stream: rtp.NewVideoRtpStream(videoSelfSsrc, defaultVideoRtpStepSamples),
 		ch: ch, ssrc: videoSelfSsrc, callID: callID, keyframeRequired: true,
@@ -805,17 +809,20 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		vsender.active = m.localVideo
 		vsender.sendGated = m.videoGate
 		m.videoTx = vsender
+		m.videoRx = videoKeyframes
 		m.appDataTx = appSender
 	}
 	e.mu.Unlock()
 	defer func() {
 		appSender.close()
+		videoKeyframes.close()
 		vsender.mu.Lock()
 		vsender.ch = nil
 		vsender.mu.Unlock()
 		e.mu.Lock()
 		if m := e.calls[callID]; m != nil {
 			m.videoTx = nil
+			m.videoRx = nil
 			m.appDataTx = nil
 		}
 		e.mu.Unlock()
@@ -948,7 +955,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 					continue
 				}
 				state.assembler = rtp.H264AccessUnitAssembler{}
-				delete(lastVideoPLI, receiver.videoSSRC)
+				videoKeyframes.forgetPeerVideo(receiver.videoSSRC)
 				delete(videoReceiveStates, receiver)
 			}
 			for receiver := range appDataReceivers {
@@ -1114,6 +1121,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 				videoReceiveStates[media.receiver] = videoState
 			}
 			videoReception.Observe(vh.Ssrc, vh.SequenceNumber, vh.Timestamp, uint64(time.Now().UnixMilli()), 90000)
+			videoKeyframes.observePeerVideo(vh.Ssrc)
 			if vh.VideoExtension != nil {
 				orientation := vh.VideoExtension.DisplayOrientation()
 				if orientation != videoState.orientation {
@@ -1150,12 +1158,8 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 				vh.Marker,
 				media.Payload,
 			)
-			if recoveryNeeded && shouldSendVideoPLI(lastVideoPLI, vh.Ssrc, time.Now()) {
-				packet, feedbackErr := videoRtcp.pictureLossIndication(vh.Ssrc)
-				if feedbackErr == nil {
-					_, feedbackErr = ch.Send(packet)
-				}
-				if feedbackErr != nil {
+			if recoveryNeeded {
+				if feedbackErr := videoKeyframes.sendPLI(vh.Ssrc, time.Now()); feedbackErr != nil {
 					log.Warn().Err(feedbackErr).Uint32("ssrc", vh.Ssrc).Msg("failed to request video keyframe after RTP loss")
 				}
 			}
@@ -1518,6 +1522,125 @@ func (s *mediaSrtcpSender) groupSenderReport(stats rtp.RtcpSenderStats, nowMs ui
 		s.index++
 	}
 	return packet, err
+}
+
+// videoFeedbackChannel is the relay transport a picture-loss indication goes out on.
+// It is an interface so the requester can be exercised without a live relay.
+type videoFeedbackChannel interface {
+	Send(data []byte) (int, error)
+}
+
+// videoKeyframeRequester asks the peer for a video keyframe with an RTCP picture-loss
+// indication. Both callers go through it — the loss-recovery path in runMedia and
+// Call.RequestVideoKeyframe — so the send, the SRTCP protection and the per-SSRC throttle
+// live in ONE place instead of being written twice with two different throttles.
+//
+// A request that arrives before any peer video RTP has been seen has no media SSRC to
+// name, so it is armed and fires on the peer's first video packet. That is the ordinary
+// case for the on-demand caller: whoever needs the first IDR asks as soon as the receiving
+// path is wired, which is normally before the peer's first packet lands.
+type videoKeyframeRequester struct {
+	rtcp *mediaSrtcpSender
+	log  zerolog.Logger
+
+	peerSSRC atomic.Uint32
+	pending  atomic.Bool
+
+	mu       sync.Mutex
+	ch       videoFeedbackChannel
+	lastSent map[uint32]time.Time
+}
+
+func newVideoKeyframeRequester(rtcp *mediaSrtcpSender, ch videoFeedbackChannel, log zerolog.Logger) *videoKeyframeRequester {
+	return &videoKeyframeRequester{
+		rtcp:     rtcp,
+		ch:       ch,
+		log:      log,
+		lastSent: make(map[uint32]time.Time),
+	}
+}
+
+// observePeerVideo records the SSRC the peer sends video on and releases a keyframe
+// request that arrived before there was one. It runs once per inbound video packet, so it
+// stays lock-free unless a request is actually pending.
+func (r *videoKeyframeRequester) observePeerVideo(ssrc uint32) {
+	if r == nil || ssrc == 0 {
+		return
+	}
+	if r.peerSSRC.Load() != ssrc {
+		r.peerSSRC.Store(ssrc)
+	}
+	if r.pending.CompareAndSwap(true, false) {
+		if err := r.sendPLI(ssrc, time.Now()); err != nil {
+			r.log.Warn().Err(err).Uint32("ssrc", ssrc).
+				Msg("failed to send the deferred video keyframe request")
+		}
+	}
+}
+
+// sendPLI builds and sends one picture-loss indication for mediaSSRC, honouring the shared
+// throttle. Being throttled is not an error: the peer already has a request in flight.
+func (r *videoKeyframeRequester) sendPLI(mediaSSRC uint32, now time.Time) error {
+	r.mu.Lock()
+	ch := r.ch
+	if ch == nil {
+		r.mu.Unlock()
+		return errors.New("meowcaller: call has no active video media")
+	}
+	if !shouldSendVideoPLI(r.lastSent, mediaSSRC, now) {
+		r.mu.Unlock()
+		return nil
+	}
+	r.mu.Unlock()
+	packet, err := r.rtcp.pictureLossIndication(mediaSSRC)
+	if err != nil {
+		return err
+	}
+	_, err = ch.Send(packet)
+	return err
+}
+
+// request asks the peer for a keyframe now. With no peer video SSRC seen yet the request
+// is armed and fires on the peer's first video packet.
+func (r *videoKeyframeRequester) request() error {
+	if r == nil {
+		return errors.New("meowcaller: call has no active video receiver")
+	}
+	r.mu.Lock()
+	ch := r.ch
+	r.mu.Unlock()
+	if ch == nil {
+		return errors.New("meowcaller: call has no active video media")
+	}
+	ssrc := r.peerSSRC.Load()
+	if ssrc == 0 {
+		r.pending.Store(true)
+		return nil
+	}
+	return r.sendPLI(ssrc, time.Now())
+}
+
+// forgetPeerVideo drops the throttle entry for a participant that left the roster, so a
+// later participant reusing that SSRC is not throttled by the old one's last request.
+func (r *videoKeyframeRequester) forgetPeerVideo(ssrc uint32) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	delete(r.lastSent, ssrc)
+	r.mu.Unlock()
+	r.peerSSRC.CompareAndSwap(ssrc, 0)
+}
+
+// close detaches the relay transport when the media loop exits. A later request then
+// reports that the call has no video media instead of writing to a dead channel.
+func (r *videoKeyframeRequester) close() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.ch = nil
+	r.mu.Unlock()
 }
 
 func shouldSendVideoPLI(lastSent map[uint32]time.Time, mediaSSRC uint32, now time.Time) bool {

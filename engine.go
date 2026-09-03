@@ -60,6 +60,7 @@ type engineCall struct {
 	videoGate         bool         // outbound upgrade is waiting for peer acceptance
 	peerVideoUpgrade  bool         // the peer's inbound upgrade is waiting for local acceptance
 	videoTx           *videoSender // video send pipeline, live while media runs
+	videoRx           *videoKeyframeRequester
 	appDataTx         *appDataSender
 	rekeyPeer         func(string) error
 	group             bool
@@ -253,6 +254,22 @@ func (e *engine) sendVideoFrame(callID string, au []byte, duration time.Duration
 	}
 	vs.send(au, duration)
 	return nil
+}
+
+// requestVideoKeyframe asks the peer to send a video keyframe now, by way of an RTCP
+// picture-loss indication on the peer's video SSRC. It is the on-demand twin of what the
+// media loop does on its own when it detects loss, and goes through the same sender.
+func (e *engine) requestVideoKeyframe(callID string) error {
+	e.mu.Lock()
+	var rx *videoKeyframeRequester
+	if m := e.calls[callID]; m != nil {
+		rx = m.videoRx
+	}
+	e.mu.Unlock()
+	if rx == nil {
+		return errors.New("meowcaller: call has no active video receiver")
+	}
+	return rx.request()
 }
 
 func (e *engine) transitionVideo(callID string, transition int) error {

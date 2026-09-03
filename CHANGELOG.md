@@ -7,6 +7,19 @@ All notable changes to meowcaller, tracked per module. Format loosely follows
 
 ## [Unreleased]
 
+### call/video — `implemented`
+
+- `Call.RequestVideoKeyframe` asks the peer for a keyframe on demand, with the
+  same RTCP picture-loss indication the media loop already sends when the
+  H.264 assembler detects loss. Both callers now go through one
+  `videoKeyframeRequester`, so the SRTCP protection and the 300 ms per-SSRC
+  throttle are written once instead of twice. A request that arrives before
+  the peer's first video packet has no media SSRC to name, so it is armed and
+  fires on that first packet; a call with no media loop running reports it
+  instead of failing silently. Without this, anything consuming the peer's
+  video that joins mid-stream stays black until the peer's own IDR cadence
+  comes round, which can be seconds.
+
 ### media/offload — `implemented`
 
 - `MediaSetup.Video` carries the negotiated video state to the offloaded media
