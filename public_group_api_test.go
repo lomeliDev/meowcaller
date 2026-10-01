@@ -216,6 +216,7 @@ func TestJoinCallLinkRunsHookBeforeApplyingFirstGroupSnapshot(t *testing.T) {
 			if entry.groupUpdate != nil {
 				t.Fatal("el hook corrió después de aplicar el primer snapshot de grupo")
 			}
+			eng.onUnknownCallEvent(callLinkFollowingGroupUpdate())
 			return nil
 		},
 	})
@@ -230,17 +231,18 @@ func TestJoinCallLinkRunsHookBeforeApplyingFirstGroupSnapshot(t *testing.T) {
 	}
 }
 
-func TestJoinCallLinkWithoutHookPreservesExistingJoin(t *testing.T) {
+func TestJoinCallLinkWithoutHookInstallsFollowingGroupUpdate(t *testing.T) {
 	eng := engineForCallLinkJoin(t, callLinkJoinGroupAck())
 	call, err := eng.joinPublicCallLink(context.Background(), "TOKEN", CallLinkOptions{})
 	if err != nil || call == nil {
 		t.Fatalf("join sin hook = (%#v, %v)", call, err)
 	}
+	eng.onUnknownCallEvent(callLinkFollowingGroupUpdate())
 	eng.mu.Lock()
 	entry := eng.calls["CID"]
 	eng.mu.Unlock()
 	if entry == nil || entry.call != call || entry.groupUpdate == nil {
-		t.Fatalf("join sin hook no conservó el estado previo: %#v", entry)
+		t.Fatalf("join sin hook no instaló el group_update posterior: %#v", entry)
 	}
 }
 
@@ -404,6 +406,18 @@ func callLinkJoinGroupAck() waBinary.Node {
 				"call-id": "CID", "call-creator": creator, "transaction-id": "5",
 				"media": "audio", "connected-limit": "8",
 			},
+		}},
+	}
+}
+
+func callLinkFollowingGroupUpdate() *waBinary.Node {
+	creator := types.NewJID("200002", types.HiddenUserServer)
+	groupInfo := callLinkJoinGroupAck().Content.([]waBinary.Node)[0]
+	return &waBinary.Node{
+		Tag: "call", Attrs: waBinary.Attrs{"from": types.NewJID("CID", "call")},
+		Content: []waBinary.Node{{
+			Tag: "group_update", Attrs: waBinary.Attrs{"call-id": "CID", "call-creator": creator},
+			Content: []waBinary.Node{groupInfo},
 		}},
 	}
 }
