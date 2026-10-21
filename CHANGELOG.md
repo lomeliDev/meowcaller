@@ -1526,6 +1526,11 @@ Entry template (newest first), grouped by module:
 
 ### media/group-offload — `KAT-verified`
 
+- The offloaded worker marks media-loop ownership at construction, so the first
+  forwarded roster or epoch update cannot start a second loop. Regression tests
+  cover both control paths. The epoch/key snapshot test checks the paired-value
+  invariant; its concurrent schedule does not reliably reproduce the old
+  nanosecond-sized race window.
 - Added the serializable group media setup/update contract and an offloaded group
   call that seeds the receiver registry from its initial roster and decrypted
   epoch. Cross-path tests compare the derived participant SRTP keys and verify

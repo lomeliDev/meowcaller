@@ -291,6 +291,55 @@ func TestOffloadedGroupBuffersEpochUntilMatchingRoster(t *testing.T) {
 	}
 }
 
+func TestOffloadedGroupControlChangesDoNotStartSecondMediaLoop(t *testing.T) {
+	tests := []struct {
+		name   string
+		change func(*OffloadedGroupCall, GroupMediaSetup) error
+	}{
+		{
+			name: "first roster update",
+			change: func(call *OffloadedGroupCall, setup GroupMediaSetup) error {
+				return call.ApplyGroupUpdate(GroupMediaUpdate{
+					TransactionID: 18, Roster: setup.Roster, Relay: setup.Relay,
+				})
+			},
+		},
+		{
+			name: "first epoch update",
+			change: func(call *OffloadedGroupCall, _ GroupMediaSetup) error {
+				return call.InstallGroupEpoch(18, bytes.Repeat([]byte{0x42}, 32))
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			setup := testGroupMediaSetup(t)
+			call, err := NewOffloadedGroupCall(setup)
+			if err != nil {
+				t.Fatalf("NewOffloadedGroupCall: %v", err)
+			}
+			defer call.eng.calls[setup.CallID].groupReceivers.clear()
+
+			if err = test.change(call, setup); err != nil {
+				t.Fatalf("apply first control change: %v", err)
+			}
+
+			call.eng.mu.Lock()
+			mediaCall := call.eng.calls[setup.CallID]
+			started, cancel := mediaCall.started, mediaCall.cancel
+			call.eng.mu.Unlock()
+			if !started {
+				t.Fatal("offloaded group call lost its media-loop ownership marker")
+			}
+			if cancel != nil {
+				cancel()
+				t.Fatal("worker engine started a second media loop")
+			}
+		})
+	}
+}
+
 func TestGroupOffloadHookForwardsAuthoritativeChanges(t *testing.T) {
 	setup := testGroupMediaSetup(t)
 	initial, err := groupUpdateFromMediaSetup(setup)

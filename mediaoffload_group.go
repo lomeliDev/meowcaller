@@ -133,6 +133,7 @@ func NewOffloadedGroupCall(setup GroupMediaSetup, opts ...Option) (*OffloadedGro
 		direction: groupDirection(setup.Inbound), group: true, groupUpdate: &update,
 		groupReceivers: receivers, groupRawEpoch: bytes.Clone(setup.Epoch.RawKey),
 		groupEpochTxID: setup.Epoch.TransactionID, hasGroupEpoch: true, relay: groupRelay,
+		started: true,
 	}
 	return &OffloadedGroupCall{call: call, eng: e, callID: setup.CallID}, nil
 }
