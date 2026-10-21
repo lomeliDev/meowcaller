@@ -19,11 +19,12 @@ import (
 //
 // The library never configures logging; pass WithLogger to surface its debug/trace.
 type Client struct {
-	wa           *whatsmeow.Client
-	log          zerolog.Logger
-	diag         *diag.Recorder
-	eng          *engine
-	mediaOffload MediaOffloadFunc
+	wa                *whatsmeow.Client
+	log               zerolog.Logger
+	diag              *diag.Recorder
+	eng               *engine
+	mediaOffload      MediaOffloadFunc
+	mediaGroupOffload MediaGroupOffloadFunc
 
 	getGroupInfo func(context.Context, types.JID) (*types.GroupInfo, error)
 	ownGroupJIDs func() []types.JID
@@ -54,7 +55,8 @@ func NewClient(wa *whatsmeow.Client, opts ...Option) *Client {
 	cfg := resolveConfig(opts)
 	c := &Client{
 		wa: wa, log: cfg.log, diag: cfg.diag, mediaOffload: cfg.mediaOffload,
-		getGroupInfo: wa.GetGroupInfo,
+		mediaGroupOffload: cfg.mediaGroupOffload,
+		getGroupInfo:      wa.GetGroupInfo,
 		ownGroupJIDs: func() []types.JID {
 			return []types.JID{wa.Store.GetJID(), wa.Store.GetLID()}
 		},

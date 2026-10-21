@@ -1523,3 +1523,10 @@ Entry template (newest first), grouped by module:
 - implemented: ParseSmplTOC body.
 - scaffolded: SmplTOC type + ParseSmplTOC signature + KAT test.
 -->
+
+### media/group-offload — `implemented`
+
+- Added the serializable group media setup/update contract and an offloaded group
+  call that seeds the receiver registry from its initial roster and decrypted
+  epoch. Cross-path tests compare the derived participant SRTP keys and verify
+  epochs arriving before their roster remain pending until the matching update.
