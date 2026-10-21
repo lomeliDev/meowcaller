@@ -1524,12 +1524,17 @@ Entry template (newest first), grouped by module:
 - scaffolded: SmplTOC type + ParseSmplTOC signature + KAT test.
 -->
 
-### media/group-offload — `implemented`
+### media/group-offload — `KAT-verified`
 
 - Added the serializable group media setup/update contract and an offloaded group
   call that seeds the receiver registry from its initial roster and decrypted
   epoch. Cross-path tests compare the derived participant SRTP keys and verify
   epochs arriving before their roster remain pending until the matching update.
+- The engine offload hook forwards authoritative roster and epoch changes, and
+  a group without `WithGroupMediaOffload` continues on the local media path;
+  the 1:1 offload callback does not capture it. Control updates arriving while
+  the initial handoff is opening are buffered and forwarded after callbacks are
+  installed.
 - Added the opt-in `WithGroupMediaOffload` engine seam. Group setup is handed
   off only when configured; subsequent authoritative roster and decrypted epoch
   updates are forwarded through explicit callbacks. The existing 1:1 offload

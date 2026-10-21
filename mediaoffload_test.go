@@ -3,7 +3,9 @@ package meowcaller
 import (
 	"bytes"
 	"testing"
+	"time"
 
+	"github.com/rs/zerolog"
 	"go.mau.fi/whatsmeow/types"
 )
 
@@ -165,27 +167,184 @@ func TestMediaOffloadDivertsInsteadOfRunningLocally(t *testing.T) {
 // participant registry that only the session holds; diverting it would produce
 // a worker that cannot decrypt anyone.
 func TestGroupCallsIgnoreTheOffload(t *testing.T) {
-	offloaded := false
-	c := &Client{mediaOffload: func(MediaSetup) error {
-		offloaded = true
+	offloaded := make(chan struct{}, 1)
+	cfg := resolveConfig(nil)
+	c := &Client{log: cfg.log, diag: cfg.diag, mediaOffload: func(MediaSetup) error {
+		offloaded <- struct{}{}
 		return nil
 	}}
 	e := newEngine(c)
 	c.eng = e
-
-	rd := sampleRelayData(t)
-	e.calls["group-1"] = &engineCall{
-		call:      &Call{eng: e, id: "group-1", peer: rd.peerJID},
-		callKey:   []byte("call-key"),
-		relay:     rd,
-		group:     true,
-		direction: CallDirectionIncoming,
+	setup := testGroupMediaSetup(t)
+	update, err := groupUpdateFromMediaSetup(setup)
+	if err != nil {
+		t.Fatalf("groupUpdateFromMediaSetup: %v", err)
+	}
+	e.calls[setup.CallID] = &engineCall{
+		call: &Call{eng: e, id: setup.CallID}, selfLID: setup.SelfLID,
+		group: true, groupUpdate: &update, groupRawEpoch: bytes.Clone(setup.Epoch.RawKey),
+		groupEpochTxID: setup.Epoch.TransactionID, hasGroupEpoch: true,
+	}
+	e.maybeStartMedia(setup.CallID)
+	e.mu.Lock()
+	startedLocally := e.calls[setup.CallID].started && !e.calls[setup.CallID].groupOffloaded
+	cancel := e.calls[setup.CallID].cancel
+	e.mu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
 
-	e.maybeStartMedia("group-1")
-
-	if offloaded {
+	select {
+	case <-offloaded:
 		t.Error("a group call was handed to the offload target")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if !startedLocally {
+		t.Error("a group call without WithGroupMediaOffload did not retain the local media path")
+	}
+}
+
+func testGroupMediaSetup(t *testing.T) GroupMediaSetup {
+	t.Helper()
+	return GroupMediaSetup{
+		CallID: "group-offload", SelfLID: "100:1@lid",
+		Epoch:  GroupMediaEpoch{TransactionID: 17, RawKey: bytes.Repeat([]byte{0x5a}, 32)},
+		Roster: []GroupParticipantSetup{{DeviceJID: "200:2@lid", PID: 9, HasPID: true}},
+		Relay: GroupRelaySetup{
+			ParticipantUUID: "participant", SelfPID: 7, HasSelfPID: true,
+			KeyASCII: []byte("relay-key"), HBHKey: []byte("hbh-key"),
+			Tokens: [][]byte{[]byte("token")}, AuthTokens: [][]byte{[]byte("auth")},
+			WarpMITagLength: 8, AttributePadding: true,
+			Endpoints: []GroupRelayEndpointSetup{{RelayID: 1, RelayName: "group", TokenID: 2,
+				AuthTokenID: 3, IPv4: "203.0.113.10", Port: 3478}},
+		},
+	}
+}
+
+func TestOffloadedGroupDerivesSameReceiveKeysAsLocalRegistry(t *testing.T) {
+	setup := testGroupMediaSetup(t)
+	offloaded, err := NewOffloadedGroupCall(setup)
+	if err != nil {
+		t.Fatalf("NewOffloadedGroupCall: %v", err)
+	}
+	defer offloaded.eng.calls[setup.CallID].groupReceivers.clear()
+
+	local, err := newParticipantReceiveRegistry(setup.CallID, setup.Epoch.RawKey, setup.SelfLID, setup.SelfLID, nil)
+	if err != nil {
+		t.Fatalf("new local registry: %v", err)
+	}
+	defer local.clear()
+	update, err := groupUpdateFromMediaSetup(setup)
+	if err != nil {
+		t.Fatalf("groupUpdateFromMediaSetup: %v", err)
+	}
+	if err = local.ApplyGroupUpdate(update); err != nil {
+		t.Fatalf("local ApplyGroupUpdate: %v", err)
+	}
+	if err = local.ApplyGroupRawEpoch(setup.Epoch.TransactionID, setup.Epoch.RawKey); err != nil {
+		t.Fatalf("local ApplyGroupRawEpoch: %v", err)
+	}
+
+	got := offloaded.eng.calls[setup.CallID].groupReceivers.byPID[9]
+	want := local.byPID[9]
+	if got == nil || want == nil {
+		t.Fatal("remote participant was not installed in both registries")
+	}
+	if got.participantID != want.participantID || got.ssrc != want.ssrc {
+		t.Fatalf("derived participant identity differs: got %q/%08x, want %q/%08x",
+			got.participantID, got.ssrc, want.participantID, want.ssrc)
+	}
+	if got.pipe.recvKeys != want.pipe.recvKeys {
+		t.Fatal("offloaded receive SRTP keys differ from the in-pod derivation")
+	}
+}
+
+func TestOffloadedGroupBuffersEpochUntilMatchingRoster(t *testing.T) {
+	setup := testGroupMediaSetup(t)
+	offloaded, err := NewOffloadedGroupCall(setup)
+	if err != nil {
+		t.Fatalf("NewOffloadedGroupCall: %v", err)
+	}
+	defer offloaded.eng.calls[setup.CallID].groupReceivers.clear()
+
+	lateEpoch := bytes.Repeat([]byte{0xa5}, 32)
+	if err = offloaded.InstallGroupEpoch(18, lateEpoch); err != nil {
+		t.Fatalf("InstallGroupEpoch before roster: %v", err)
+	}
+	if _, ok := offloaded.eng.calls[setup.CallID].groupReceivers.pendingEpochs[18]; !ok {
+		t.Fatal("out-of-order epoch was not parked")
+	}
+	update := GroupMediaUpdate{
+		TransactionID: 18, Roster: setup.Roster, Relay: setup.Relay,
+	}
+	if err = offloaded.ApplyGroupUpdate(update); err != nil {
+		t.Fatalf("ApplyGroupUpdate: %v", err)
+	}
+	registry := offloaded.eng.calls[setup.CallID].groupReceivers
+	if !registry.hasEpoch || registry.installedEpoch.transactionID != 18 {
+		t.Fatalf("installed epoch tx = %d, want 18", registry.installedEpoch.transactionID)
+	}
+	if _, ok := registry.pendingEpochs[18]; ok {
+		t.Fatal("matching roster did not consume the pending epoch")
+	}
+}
+
+func TestGroupOffloadHookForwardsAuthoritativeChanges(t *testing.T) {
+	setup := testGroupMediaSetup(t)
+	initial, err := groupUpdateFromMediaSetup(setup)
+	if err != nil {
+		t.Fatalf("groupUpdateFromMediaSetup: %v", err)
+	}
+	setupReady := make(chan GroupMediaSetup, 1)
+	continueOffload := make(chan struct{})
+	started := make(chan struct{})
+	var gotUpdate GroupMediaUpdate
+	var gotEpoch uint32
+	var gotRaw []byte
+	c := &Client{log: zerolog.Nop(), mediaGroupOffload: func(got GroupMediaSetup) (GroupMediaCallbacks, error) {
+		setupReady <- got
+		<-continueOffload
+		return GroupMediaCallbacks{
+			OnGroupUpdate: func(update GroupMediaUpdate) error { gotUpdate = update; return nil },
+			OnGroupEpoch: func(txID uint32, raw []byte) error {
+				gotEpoch, gotRaw = txID, bytes.Clone(raw)
+				return nil
+			},
+		}, nil
+	}}
+	e := newEngine(c)
+	c.eng = e
+	e.calls[setup.CallID] = &engineCall{
+		call: &Call{eng: e, id: setup.CallID}, selfLID: setup.SelfLID,
+		group: true, groupUpdate: &initial, groupRawEpoch: bytes.Clone(setup.Epoch.RawKey),
+		groupEpochTxID: setup.Epoch.TransactionID, hasGroupEpoch: true,
+	}
+	go func() {
+		e.maybeStartMedia(setup.CallID)
+		close(started)
+	}()
+	gotSetup := <-setupReady
+	if gotSetup.CallID != setup.CallID || gotSetup.SelfPID != setup.Relay.SelfPID || len(gotSetup.Roster) != 1 {
+		t.Fatal("offload setup lost call identity, self PID, or participant roster")
+	}
+
+	next := initial
+	next.TransactionID = 18
+	next.RekeyRequested = true
+	if !e.applyGroupUpdate(next) {
+		t.Fatal("authoritative roster update was not installed")
+	}
+	nextEpoch := bytes.Repeat([]byte{0xa5}, 32)
+	if err = e.installGroupEpoch(setup.CallID, 18, nextEpoch); err != nil {
+		t.Fatalf("forward epoch: %v", err)
+	}
+	close(continueOffload)
+	<-started
+	if gotUpdate.TransactionID != 18 || !gotUpdate.RekeySeen || len(gotUpdate.Roster) != 1 {
+		t.Fatal("offload callback received incomplete roster transaction metadata")
+	}
+	if gotEpoch != 18 || !bytes.Equal(gotRaw, nextEpoch) {
+		t.Fatalf("offload callback epoch = %d/%d bytes, want 18/32", gotEpoch, len(gotRaw))
 	}
 }
 

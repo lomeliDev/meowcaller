@@ -95,6 +95,9 @@ func (e *engine) maybeStartMedia(callID string) {
 	selfLID, peerLID := m.selfLID, m.peerLID
 	inbound := m.direction == CallDirectionIncoming
 	isGroup := m.group
+	if isGroup && e.c != nil && e.c.mediaGroupOffload != nil {
+		m.groupOffloading = true
+	}
 	video := m.localVideo || m.remoteVideo
 	e.mu.Unlock()
 
@@ -117,16 +120,46 @@ func (e *engine) maybeStartMedia(callID string) {
 		e.c.log.Info().Str("call_id", callID).Msg("handing group media to an offload target")
 		callbacks, err := offload(setup)
 		clear(callKey)
+		if err == nil && (callbacks.OnGroupUpdate == nil || callbacks.OnGroupEpoch == nil) {
+			err = errors.New("meowcaller: group media offload callbacks are incomplete")
+		}
 		if err != nil {
+			e.mu.Lock()
+			if current := e.calls[callID]; current != nil {
+				current.groupOffloading = false
+			}
+			e.mu.Unlock()
 			e.c.log.Warn().Err(err).Str("call_id", callID).Msg("group media offload failed")
 			return
 		}
 		e.mu.Lock()
 		if current = e.calls[callID]; current != nil {
 			current.groupOffloaded = true
+			current.groupOffloading = false
 			current.groupCallbacks = callbacks
+			pendingUpdates := current.pendingGroupUpdates
+			pendingEpochs := current.pendingGroupEpochs
+			current.pendingGroupUpdates = nil
+			current.pendingGroupEpochs = nil
+			e.mu.Unlock()
+			for _, next := range pendingUpdates {
+				if callbacks.OnGroupUpdate != nil {
+					if err := callbacks.OnGroupUpdate(next); err != nil {
+						e.c.log.Warn().Err(err).Str("call_id", callID).Msg("forward buffered group roster failed")
+					}
+				}
+			}
+			for _, next := range pendingEpochs {
+				if callbacks.OnGroupEpoch != nil {
+					if err := callbacks.OnGroupEpoch(next.TransactionID, next.RawKey); err != nil {
+						e.c.log.Warn().Err(err).Str("call_id", callID).Msg("forward buffered group epoch failed")
+					}
+				}
+				clear(next.RawKey)
+			}
+		} else {
+			e.mu.Unlock()
 		}
-		e.mu.Unlock()
 		return
 	}
 

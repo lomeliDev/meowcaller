@@ -171,10 +171,11 @@ func (e *engine) applyGroupUpdate(update groupCallUpdate) bool {
 	stored := cloneGroupCallUpdate(update)
 	receivers := m.groupReceivers
 	offloaded := m.groupOffloaded
+	offloading := m.groupOffloading
 	callbacks := m.groupCallbacks
 	e.mu.Unlock()
 
-	if receivers != nil && !offloaded {
+	if receivers != nil && !offloaded && !offloading {
 		if err := receivers.ApplyGroupUpdate(stored); err != nil {
 			e.c.log.Warn().Err(err).Str("call_id", update.CallID).Msg("apply group media roster failed")
 			return false
@@ -203,6 +204,13 @@ func (e *engine) applyGroupUpdate(update groupCallUpdate) bool {
 	call := m.call
 	offloaded = m.groupOffloaded
 	callbacks = m.groupCallbacks
+	if m.groupOffloading && !m.groupOffloaded {
+		setup := groupMediaSetupFrom(update.CallID, m.selfLID, 0, nil, stored)
+		m.pendingGroupUpdates = append(m.pendingGroupUpdates, GroupMediaUpdate{
+			TransactionID: stored.TransactionID, Roster: setup.Roster, Relay: setup.Relay,
+			RekeySeen: stored.RekeyRequested,
+		})
+	}
 	waitingRoomCancel := m.waitingRoomCancel
 	m.waitingRoomCancel = nil
 	e.mu.Unlock()
@@ -214,6 +222,8 @@ func (e *engine) applyGroupUpdate(update groupCallUpdate) bool {
 		}); err != nil {
 			e.c.log.Warn().Err(err).Str("call_id", update.CallID).Msg("forward group media roster failed")
 		}
+	} else if offloaded {
+		e.c.log.Warn().Str("call_id", update.CallID).Msg("group media roster callback is unavailable")
 	}
 	e.c.log.Debug().
 		Str("call_id", update.CallID).
@@ -301,6 +311,7 @@ func (e *engine) installGroupEpoch(callID string, transactionID uint32, rawKey [
 	}
 	receivers := m.groupReceivers
 	offloaded := m.groupOffloaded
+	offloading := m.groupOffloading
 	callbacks := m.groupCallbacks
 	e.mu.Unlock()
 	if offloaded {
@@ -320,6 +331,21 @@ func (e *engine) installGroupEpoch(callID string, transactionID uint32, rawKey [
 			e.mu.Unlock()
 			return nil
 		}
+		return errors.New("meowcaller: group media epoch callback is unavailable")
+	}
+	if offloading {
+		e.mu.Lock()
+		if current := e.calls[callID]; current != nil && current.group &&
+			transactionID > current.groupEpochTxID {
+			clear(current.groupRawEpoch)
+			current.groupRawEpoch = bytes.Clone(rawKey)
+			current.groupEpochTxID = transactionID
+			current.hasGroupEpoch = true
+			current.pendingGroupEpochs = append(current.pendingGroupEpochs, GroupMediaEpoch{
+				TransactionID: transactionID, RawKey: bytes.Clone(rawKey),
+			})
+		}
+		e.mu.Unlock()
 		return nil
 	}
 	if receivers != nil {

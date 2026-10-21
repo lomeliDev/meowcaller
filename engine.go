@@ -53,29 +53,32 @@ type engineCall struct {
 	creator types.JID // call-creator JID (for accept/relaylatency)
 	from    types.JID // the <call> "from" — where stanzas are addressed
 
-	direction         CallDirection
-	codec             AudioCodec   // audio codec for this call, selected from voip_settings (MLow default)
-	localVideo        bool         // this client is sending, or has requested to send, video
-	remoteVideo       bool         // the peer is sending video to this client
-	videoGate         bool         // outbound upgrade is waiting for peer acceptance
-	peerVideoUpgrade  bool         // the peer's inbound upgrade is waiting for local acceptance
-	videoTx           *videoSender // video send pipeline, live while media runs
-	videoRx           *videoKeyframeRequester
-	appDataTx         *appDataSender
-	rekeyPeer         func(string) error
-	group             bool
-	groupUpdate       *groupCallUpdate
-	groupReceivers    *participantReceiveRegistry
-	groupOffloaded    bool
-	groupCallbacks    GroupMediaCallbacks
-	groupRawEpoch     []byte
-	groupEpochTxID    uint32
-	hasGroupEpoch     bool
-	started           bool
-	cancel            context.CancelFunc // tears down this call's media goroutine
-	waitingRoomCancel context.CancelFunc
-	inviteSelfDevice  groupCallDevice
-	invitePeerDevice  groupCallDevice
+	direction           CallDirection
+	codec               AudioCodec   // audio codec for this call, selected from voip_settings (MLow default)
+	localVideo          bool         // this client is sending, or has requested to send, video
+	remoteVideo         bool         // the peer is sending video to this client
+	videoGate           bool         // outbound upgrade is waiting for peer acceptance
+	peerVideoUpgrade    bool         // the peer's inbound upgrade is waiting for local acceptance
+	videoTx             *videoSender // video send pipeline, live while media runs
+	videoRx             *videoKeyframeRequester
+	appDataTx           *appDataSender
+	rekeyPeer           func(string) error
+	group               bool
+	groupUpdate         *groupCallUpdate
+	groupReceivers      *participantReceiveRegistry
+	groupOffloaded      bool
+	groupOffloading     bool
+	groupCallbacks      GroupMediaCallbacks
+	pendingGroupUpdates []GroupMediaUpdate
+	pendingGroupEpochs  []GroupMediaEpoch
+	groupRawEpoch       []byte
+	groupEpochTxID      uint32
+	hasGroupEpoch       bool
+	started             bool
+	cancel              context.CancelFunc // tears down this call's media goroutine
+	waitingRoomCancel   context.CancelFunc
+	inviteSelfDevice    groupCallDevice
+	invitePeerDevice    groupCallDevice
 
 	// The callee <accept> is deferred until the caller's <mute_v2> arrives.
 	acceptPending bool
