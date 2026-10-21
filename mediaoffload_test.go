@@ -2,6 +2,8 @@ package meowcaller
 
 import (
 	"bytes"
+	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -316,7 +318,8 @@ func TestGroupOffloadHookForwardsAuthoritativeChanges(t *testing.T) {
 	c.eng = e
 	e.calls[setup.CallID] = &engineCall{
 		call: &Call{eng: e, id: setup.CallID}, selfLID: setup.SelfLID,
-		group: true, groupUpdate: &initial, groupRawEpoch: bytes.Clone(setup.Epoch.RawKey),
+		direction: CallDirectionIncoming,
+		group:     true, groupUpdate: &initial, groupRawEpoch: bytes.Clone(setup.Epoch.RawKey),
 		groupEpochTxID: setup.Epoch.TransactionID, hasGroupEpoch: true,
 	}
 	go func() {
@@ -324,8 +327,11 @@ func TestGroupOffloadHookForwardsAuthoritativeChanges(t *testing.T) {
 		close(started)
 	}()
 	gotSetup := <-setupReady
-	if gotSetup.CallID != setup.CallID || gotSetup.SelfPID != setup.Relay.SelfPID || len(gotSetup.Roster) != 1 {
-		t.Fatal("offload setup lost call identity, self PID, or participant roster")
+	if gotSetup.CallID != setup.CallID || gotSetup.SelfPID != setup.Relay.SelfPID || len(gotSetup.Roster) != 1 || !gotSetup.Inbound {
+		t.Fatal("offload setup lost call identity, inbound direction, self PID, or participant roster")
+	}
+	if gotSetup.Epoch.TransactionID != setup.Epoch.TransactionID || !bytes.Equal(gotSetup.Epoch.RawKey, setup.Epoch.RawKey) {
+		t.Fatal("offload setup paired the initial epoch key with a different transaction")
 	}
 
 	next := initial
@@ -346,6 +352,98 @@ func TestGroupOffloadHookForwardsAuthoritativeChanges(t *testing.T) {
 	if gotEpoch != 18 || !bytes.Equal(gotRaw, nextEpoch) {
 		t.Fatalf("offload callback epoch = %d/%d bytes, want 18/32", gotEpoch, len(gotRaw))
 	}
+}
+
+func TestGroupOffloadSetupSnapshotsEpochAndTransactionTogether(t *testing.T) {
+	const iterations = 16
+	for range iterations {
+		setup := testGroupMediaSetup(t)
+		initial, err := groupUpdateFromMediaSetup(setup)
+		if err != nil {
+			t.Fatalf("groupUpdateFromMediaSetup: %v", err)
+		}
+		setupReady := make(chan GroupMediaSetup, 1)
+		c := &Client{log: zerolog.Nop(), mediaGroupOffload: func(got GroupMediaSetup) (GroupMediaCallbacks, error) {
+			setupReady <- got
+			return GroupMediaCallbacks{
+				OnGroupUpdate: func(GroupMediaUpdate) error { return nil },
+				OnGroupEpoch:  func(uint32, []byte) error { return nil },
+			}, nil
+		}}
+		e := newEngine(c)
+		c.eng = e
+		e.calls[setup.CallID] = &engineCall{
+			call: &Call{eng: e, id: setup.CallID}, selfLID: setup.SelfLID,
+			group: true, groupUpdate: &initial, groupRawEpoch: bytes.Clone(setup.Epoch.RawKey),
+			groupEpochTxID: setup.Epoch.TransactionID, hasGroupEpoch: true,
+		}
+
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			for txID := uint32(18); txID < 82; txID++ {
+				raw := bytes.Repeat([]byte{byte(txID)}, 32)
+				if updateErr := e.installGroupEpoch(setup.CallID, txID, raw); updateErr != nil {
+					t.Errorf("install epoch %d: %v", txID, updateErr)
+					return
+				}
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			e.maybeStartMedia(setup.CallID)
+		}()
+		close(start)
+		got := <-setupReady
+		wg.Wait()
+		wantByte := byte(got.Epoch.TransactionID)
+		if got.Epoch.TransactionID == setup.Epoch.TransactionID {
+			wantByte = setup.Epoch.RawKey[0]
+		}
+		if len(got.Epoch.RawKey) != 32 || !bytes.Equal(got.Epoch.RawKey, bytes.Repeat([]byte{wantByte}, 32)) {
+			t.Fatalf("setup paired epoch transaction %d with a different key", got.Epoch.TransactionID)
+		}
+	}
+}
+
+func TestOffloadedGroupRunSnapshotsEpochDuringConcurrentRotation(t *testing.T) {
+	setup := testGroupMediaSetup(t)
+	offloaded, err := NewOffloadedGroupCall(setup)
+	if err != nil {
+		t.Fatalf("NewOffloadedGroupCall: %v", err)
+	}
+	defer offloaded.eng.calls[setup.CallID].groupReceivers.clear()
+
+	const iterations = 64
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		for range iterations {
+			_ = offloaded.Run(ctx)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		for txID := uint32(18); txID < 18+iterations; txID++ {
+			raw := bytes.Repeat([]byte{byte(txID)}, 32)
+			if installErr := offloaded.InstallGroupEpoch(txID, raw); installErr != nil {
+				t.Errorf("InstallGroupEpoch(%d): %v", txID, installErr)
+				return
+			}
+		}
+	}()
+	close(start)
+	wg.Wait()
 }
 
 // TestOffloadedVideoCallStartsWithTheSenderActive guards the one thing the

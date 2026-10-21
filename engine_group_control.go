@@ -202,10 +202,12 @@ func (e *engine) applyGroupUpdate(update groupCallUpdate) bool {
 	}
 	m.from = types.NewJID(update.CallID, "call")
 	call := m.call
+	selfLID := m.selfLID
+	inbound := m.direction == CallDirectionIncoming
 	offloaded = m.groupOffloaded
 	callbacks = m.groupCallbacks
 	if m.groupOffloading && !m.groupOffloaded {
-		setup := groupMediaSetupFrom(update.CallID, m.selfLID, 0, nil, stored)
+		setup := groupMediaSetupFrom(update.CallID, selfLID, inbound, 0, nil, stored)
 		m.pendingGroupUpdates = append(m.pendingGroupUpdates, GroupMediaUpdate{
 			TransactionID: stored.TransactionID, Roster: setup.Roster, Relay: setup.Relay,
 			RekeySeen: stored.RekeyRequested,
@@ -215,7 +217,7 @@ func (e *engine) applyGroupUpdate(update groupCallUpdate) bool {
 	m.waitingRoomCancel = nil
 	e.mu.Unlock()
 	if offloaded && callbacks.OnGroupUpdate != nil {
-		setup := groupMediaSetupFrom(update.CallID, m.selfLID, 0, nil, stored)
+		setup := groupMediaSetupFrom(update.CallID, selfLID, inbound, 0, nil, stored)
 		if err := callbacks.OnGroupUpdate(GroupMediaUpdate{
 			TransactionID: stored.TransactionID, Roster: setup.Roster, Relay: setup.Relay,
 			RekeySeen: stored.RekeyRequested,

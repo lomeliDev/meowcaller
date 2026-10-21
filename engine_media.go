@@ -87,8 +87,12 @@ func (e *engine) maybeStartMedia(callID string) {
 	m.cancel = cancel
 	call := m.call
 	var callKey []byte
+	var groupUpdate groupCallUpdate
+	var groupEpoch uint32
 	if m.group {
 		callKey = append([]byte(nil), m.groupRawEpoch...)
+		groupUpdate = cloneGroupCallUpdate(*m.groupUpdate)
+		groupEpoch = m.groupEpochTxID
 	} else {
 		callKey = append([]byte(nil), m.callKey...)
 	}
@@ -102,20 +106,11 @@ func (e *engine) maybeStartMedia(callID string) {
 	e.mu.Unlock()
 
 	if isGroup && e.c != nil && e.c.mediaGroupOffload != nil {
-		e.mu.Lock()
-		current := e.calls[callID]
-		var update groupCallUpdate
-		var epoch uint32
-		if current != nil && current.groupUpdate != nil {
-			update = cloneGroupCallUpdate(*current.groupUpdate)
-			epoch = current.groupEpochTxID
-		}
-		e.mu.Unlock()
-		if current == nil || update.CallID == "" {
+		if groupUpdate.CallID == "" {
 			clear(callKey)
 			return
 		}
-		setup := groupMediaSetupFrom(callID, selfLID, epoch, callKey, update)
+		setup := groupMediaSetupFrom(callID, selfLID, inbound, groupEpoch, callKey, groupUpdate)
 		offload := e.c.mediaGroupOffload
 		e.c.log.Info().Str("call_id", callID).Msg("handing group media to an offload target")
 		callbacks, err := offload(setup)
@@ -133,7 +128,7 @@ func (e *engine) maybeStartMedia(callID string) {
 			return
 		}
 		e.mu.Lock()
-		if current = e.calls[callID]; current != nil {
+		if current := e.calls[callID]; current != nil {
 			current.groupOffloaded = true
 			current.groupOffloading = false
 			current.groupCallbacks = callbacks

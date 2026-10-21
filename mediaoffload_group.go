@@ -14,6 +14,7 @@ import (
 type GroupMediaSetup struct {
 	CallID          string
 	SelfLID         string
+	Inbound         bool
 	SelfPID         uint32
 	HasSelfPID      bool
 	ParticipantUUID string
@@ -122,14 +123,14 @@ func NewOffloadedGroupCall(setup GroupMediaSetup, opts ...Option) (*OffloadedGro
 		receivers.clear()
 		return nil, fmt.Errorf("meowcaller: initialize offloaded group epoch: %w", err)
 	}
-	groupRelay, err := groupRelayData(update, false)
+	groupRelay, err := groupRelayData(update, setup.Inbound)
 	if err != nil {
 		receivers.clear()
 		return nil, err
 	}
 	e.calls[setup.CallID] = &engineCall{
 		call: call, selfLID: setup.SelfLID, peerLID: setup.SelfLID,
-		direction: CallDirectionOutgoing, group: true, groupUpdate: &update,
+		direction: groupDirection(setup.Inbound), group: true, groupUpdate: &update,
 		groupReceivers: receivers, groupRawEpoch: bytes.Clone(setup.Epoch.RawKey),
 		groupEpochTxID: setup.Epoch.TransactionID, hasGroupEpoch: true, relay: groupRelay,
 	}
@@ -150,14 +151,17 @@ func (o *OffloadedGroupCall) Call() *Call { return o.call }
 func (o *OffloadedGroupCall) Run(ctx context.Context) error {
 	o.eng.mu.Lock()
 	m := o.eng.calls[o.callID]
-	o.eng.mu.Unlock()
 	if m == nil {
+		o.eng.mu.Unlock()
 		return errors.New("meowcaller: offloaded group call was already torn down")
 	}
-	o.call.setPhase(CallPhaseConnecting)
 	key := bytes.Clone(m.groupRawEpoch)
+	selfLID, peerLID, relay := m.selfLID, m.peerLID, m.relay
+	inbound := m.direction == CallDirectionIncoming
+	o.eng.mu.Unlock()
+	o.call.setPhase(CallPhaseConnecting)
 	defer clear(key)
-	return o.eng.runMedia(ctx, o.callID, o.call, key, m.selfLID, m.peerLID, m.relay, false)
+	return o.eng.runMedia(ctx, o.callID, o.call, key, selfLID, peerLID, relay, inbound)
 }
 
 // ApplyGroupUpdate installs a newer authoritative roster on the media owner.
@@ -213,8 +217,15 @@ func groupCallUpdateFromMediaUpdate(callID string, update GroupMediaUpdate) (gro
 	return out, nil
 }
 
-func groupMediaSetupFrom(callID, selfLID string, epoch uint32, raw []byte, update groupCallUpdate) GroupMediaSetup {
-	setup := GroupMediaSetup{CallID: callID, SelfLID: selfLID,
+func groupDirection(inbound bool) CallDirection {
+	if inbound {
+		return CallDirectionIncoming
+	}
+	return CallDirectionOutgoing
+}
+
+func groupMediaSetupFrom(callID, selfLID string, inbound bool, epoch uint32, raw []byte, update groupCallUpdate) GroupMediaSetup {
+	setup := GroupMediaSetup{CallID: callID, SelfLID: selfLID, Inbound: inbound,
 		Epoch: GroupMediaEpoch{TransactionID: epoch, RawKey: bytes.Clone(raw)}}
 	if update.Relay != nil {
 		setup.SelfPID, setup.HasSelfPID = update.Relay.SelfPID, update.Relay.HasSelfPID

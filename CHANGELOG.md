@@ -1535,6 +1535,10 @@ Entry template (newest first), grouped by module:
   the 1:1 offload callback does not capture it. Control updates arriving while
   the initial handoff is opening are buffered and forwarded after callbacks are
   installed.
+- Group setup now carries the call's inbound direction through relay selection
+  and `Run`. The handoff snapshots its epoch key and transaction together, and
+  `Run` snapshots the epoch, LIDs, and relay under the engine lock. Tests cover
+  direction preservation, matching epoch/key snapshots, and concurrent rotation.
 - Added the opt-in `WithGroupMediaOffload` engine seam. Group setup is handed
   off only when configured; subsequent authoritative roster and decrypted epoch
   updates are forwarded through explicit callbacks. The existing 1:1 offload
