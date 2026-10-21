@@ -170,9 +170,11 @@ func (e *engine) applyGroupUpdate(update groupCallUpdate) bool {
 	}
 	stored := cloneGroupCallUpdate(update)
 	receivers := m.groupReceivers
+	offloaded := m.groupOffloaded
+	callbacks := m.groupCallbacks
 	e.mu.Unlock()
 
-	if receivers != nil {
+	if receivers != nil && !offloaded {
 		if err := receivers.ApplyGroupUpdate(stored); err != nil {
 			e.c.log.Warn().Err(err).Str("call_id", update.CallID).Msg("apply group media roster failed")
 			return false
@@ -199,9 +201,20 @@ func (e *engine) applyGroupUpdate(update groupCallUpdate) bool {
 	}
 	m.from = types.NewJID(update.CallID, "call")
 	call := m.call
+	offloaded = m.groupOffloaded
+	callbacks = m.groupCallbacks
 	waitingRoomCancel := m.waitingRoomCancel
 	m.waitingRoomCancel = nil
 	e.mu.Unlock()
+	if offloaded && callbacks.OnGroupUpdate != nil {
+		setup := groupMediaSetupFrom(update.CallID, m.selfLID, 0, nil, stored)
+		if err := callbacks.OnGroupUpdate(GroupMediaUpdate{
+			TransactionID: stored.TransactionID, Roster: setup.Roster, Relay: setup.Relay,
+			RekeySeen: stored.RekeyRequested,
+		}); err != nil {
+			e.c.log.Warn().Err(err).Str("call_id", update.CallID).Msg("forward group media roster failed")
+		}
+	}
 	e.c.log.Debug().
 		Str("call_id", update.CallID).
 		Uint32("transaction_id", update.TransactionID).
@@ -287,7 +300,28 @@ func (e *engine) installGroupEpoch(callID string, transactionID uint32, rawKey [
 		}
 	}
 	receivers := m.groupReceivers
+	offloaded := m.groupOffloaded
+	callbacks := m.groupCallbacks
 	e.mu.Unlock()
+	if offloaded {
+		if callbacks.OnGroupEpoch != nil {
+			if err := callbacks.OnGroupEpoch(transactionID, bytes.Clone(rawKey)); err != nil {
+				return err
+			}
+			e.mu.Lock()
+			if current := e.calls[callID]; current != nil && current.group {
+				if transactionID > current.groupEpochTxID {
+					clear(current.groupRawEpoch)
+					current.groupRawEpoch = bytes.Clone(rawKey)
+					current.groupEpochTxID = transactionID
+					current.hasGroupEpoch = true
+				}
+			}
+			e.mu.Unlock()
+			return nil
+		}
+		return nil
+	}
 	if receivers != nil {
 		if err := receivers.ApplyGroupRawEpoch(transactionID, rawKey); err != nil {
 			return err

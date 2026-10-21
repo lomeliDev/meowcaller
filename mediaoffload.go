@@ -52,9 +52,9 @@ type RelayAddressSetup struct {
 // else. Returning an error leaves the call without media.
 type MediaOffloadFunc func(MediaSetup) error
 
-// WithMediaOffload diverts the media loop out of this process. The session keeps
-// owning signaling; whoever receives the setup owns the relay transport, the
-// keying and the codec. Group calls are unaffected and always run locally.
+// WithMediaOffload diverts the 1:1 media loop out of this process. The session
+// keeps owning signaling; whoever receives the setup owns the relay transport,
+// the keying and the codec. Group calls require WithGroupMediaOffload.
 func WithMediaOffload(fn MediaOffloadFunc) Option {
 	return func(c *config) { c.mediaOffload = fn }
 }

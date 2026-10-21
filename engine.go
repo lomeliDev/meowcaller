@@ -66,6 +66,8 @@ type engineCall struct {
 	group             bool
 	groupUpdate       *groupCallUpdate
 	groupReceivers    *participantReceiveRegistry
+	groupOffloaded    bool
+	groupCallbacks    GroupMediaCallbacks
 	groupRawEpoch     []byte
 	groupEpochTxID    uint32
 	hasGroupEpoch     bool

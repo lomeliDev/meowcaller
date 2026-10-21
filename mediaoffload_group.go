@@ -75,7 +75,7 @@ type GroupMediaCallbacks struct {
 }
 
 // MediaGroupOffloadFunc transfers group media to another process.
-type MediaGroupOffloadFunc func(GroupMediaSetup, GroupMediaCallbacks) error
+type MediaGroupOffloadFunc func(GroupMediaSetup) (GroupMediaCallbacks, error)
 
 // WithGroupMediaOffload diverts group media while keeping signaling in this process.
 func WithGroupMediaOffload(fn MediaGroupOffloadFunc) Option {
@@ -167,17 +167,6 @@ func (o *OffloadedGroupCall) ApplyGroupUpdate(update GroupMediaUpdate) error {
 		return err
 	}
 	if !o.eng.applyGroupUpdate(internal) {
-		return fmt.Errorf("meowcaller: group update transaction %d was not applied", update.TransactionID)
-	}
-	return nil
-}
-
-func (e *engine) applyOffloadedGroupUpdate(callID string, update GroupMediaUpdate) error {
-	internal, err := groupCallUpdateFromMediaUpdate(callID, update)
-	if err != nil {
-		return err
-	}
-	if !e.applyGroupUpdate(internal) {
 		return fmt.Errorf("meowcaller: group update transaction %d was not applied", update.TransactionID)
 	}
 	return nil

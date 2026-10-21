@@ -1530,3 +1530,7 @@ Entry template (newest first), grouped by module:
   call that seeds the receiver registry from its initial roster and decrypted
   epoch. Cross-path tests compare the derived participant SRTP keys and verify
   epochs arriving before their roster remain pending until the matching update.
+- Added the opt-in `WithGroupMediaOffload` engine seam. Group setup is handed
+  off only when configured; subsequent authoritative roster and decrypted epoch
+  updates are forwarded through explicit callbacks. The existing 1:1 offload
+  path remains unchanged, and groups without the new option stay local.

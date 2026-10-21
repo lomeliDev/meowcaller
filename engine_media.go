@@ -98,6 +98,38 @@ func (e *engine) maybeStartMedia(callID string) {
 	video := m.localVideo || m.remoteVideo
 	e.mu.Unlock()
 
+	if isGroup && e.c != nil && e.c.mediaGroupOffload != nil {
+		e.mu.Lock()
+		current := e.calls[callID]
+		var update groupCallUpdate
+		var epoch uint32
+		if current != nil && current.groupUpdate != nil {
+			update = cloneGroupCallUpdate(*current.groupUpdate)
+			epoch = current.groupEpochTxID
+		}
+		e.mu.Unlock()
+		if current == nil || update.CallID == "" {
+			clear(callKey)
+			return
+		}
+		setup := groupMediaSetupFrom(callID, selfLID, epoch, callKey, update)
+		offload := e.c.mediaGroupOffload
+		e.c.log.Info().Str("call_id", callID).Msg("handing group media to an offload target")
+		callbacks, err := offload(setup)
+		clear(callKey)
+		if err != nil {
+			e.c.log.Warn().Err(err).Str("call_id", callID).Msg("group media offload failed")
+			return
+		}
+		e.mu.Lock()
+		if current = e.calls[callID]; current != nil {
+			current.groupOffloaded = true
+			current.groupCallbacks = callbacks
+		}
+		e.mu.Unlock()
+		return
+	}
+
 	if !isGroup && e.c != nil && e.c.mediaOffload != nil {
 		setup := mediaSetupFrom(callID, callKey, selfLID, peerLID, rd, inbound, video)
 		offload := e.c.mediaOffload
