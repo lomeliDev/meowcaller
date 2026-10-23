@@ -7,6 +7,16 @@ All notable changes to meowcaller, tracked per module. Format loosely follows
 
 ## [Unreleased]
 
+### call/1to1-signaling — `implemented`
+
+- When a direct outgoing call receives the callee's `<accept>`, the caller now
+  confirms it with the one-shot `<transport>` control that the protocol's
+  caller path emits. The control is addressed to the accepting device and
+  carries the original call creator plus `p2p-cand-round=1` and
+  `transport-message-type=1`; it is not coupled to media offload or worker
+  readiness. A failed send remains retryable on a later accept delivery, while
+  group, incoming, ended, and unaddressable accepts do not emit it.
+
 ### media/offload — `implemented`
 
 - `WithMediaOffloadRekey` is an optional callback for the session process to

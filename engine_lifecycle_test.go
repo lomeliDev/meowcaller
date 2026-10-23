@@ -374,6 +374,241 @@ func TestOutgoingPeerAcceptLifecycle(t *testing.T) {
 	}
 }
 
+func TestOutgoingAcceptSendsCallerTransportToAnsweringDevice(t *testing.T) {
+	eng, call := testEngineWithOutgoingCall()
+	answeringDevice := peerJID()
+	answeringDevice.Device = 7
+	var sent []waBinary.Node
+	eng.sendCallNode = func(_ context.Context, node waBinary.Node) error {
+		sent = append(sent, node)
+		return nil
+	}
+
+	eng.onAccept(&events.CallAccept{
+		BasicCallMeta: types.BasicCallMeta{CallID: call.ID(), From: answeringDevice},
+		Data:          &waBinary.Node{Tag: "accept"},
+	})
+
+	if len(sent) != 1 {
+		t.Fatalf("caller transport stanzas = %d, want 1", len(sent))
+	}
+	callNode := sent[0]
+	if got := callNode.AttrGetter().JID("to"); got != answeringDevice {
+		t.Fatalf("transport to = %s, want answering device %s", got, answeringDevice)
+	}
+	children := callNode.GetChildren()
+	if len(children) != 1 || children[0].Tag != "transport" {
+		t.Fatalf("transport call content = %#v", children)
+	}
+	transport := children[0]
+	attrs := transport.AttrGetter()
+	if got := attrs.String("call-id"); got != call.ID() {
+		t.Fatalf("transport call-id = %q, want %q", got, call.ID())
+	}
+	if got := attrs.JID("call-creator"); got != creatorJID() {
+		t.Fatalf("transport call-creator = %s, want %s", got, creatorJID())
+	}
+	if got := attrs.String("p2p-cand-round"); got != "1" {
+		t.Fatalf("transport p2p-cand-round = %q, want 1", got)
+	}
+	if got := attrs.String("transport-message-type"); got != "1" {
+		t.Fatalf("transport message type = %q, want 1", got)
+	}
+	kids := transport.GetChildren()
+	if len(kids) != 1 || kids[0].Tag != "net" || kids[0].AttrGetter().String("medium") != "2" || kids[0].AttrGetter().String("protocol") != "0" {
+		t.Fatalf("transport net = %#v, want net medium=2 protocol=0", kids)
+	}
+}
+
+func TestOutgoingAcceptCallerTransportIsOneShotAndRetriesAfterSendError(t *testing.T) {
+	eng, call := testEngineWithOutgoingCall()
+	answeringDevice := peerJID()
+	answeringDevice.Device = 7
+	attempts := 0
+	eng.sendCallNode = func(_ context.Context, _ waBinary.Node) error {
+		attempts++
+		if attempts == 1 {
+			return errors.New("transient transport failure")
+		}
+		return nil
+	}
+	event := &events.CallAccept{
+		BasicCallMeta: types.BasicCallMeta{CallID: call.ID(), From: answeringDevice},
+		Data:          &waBinary.Node{Tag: "accept"},
+	}
+
+	eng.onAccept(event)
+	eng.onAccept(event)
+	eng.onAccept(event)
+
+	if attempts != 2 {
+		t.Fatalf("caller transport attempts = %d, want failed attempt plus one retry", attempts)
+	}
+	eng.mu.Lock()
+	sent, busy := eng.calls[call.ID()].callerTransportSent, eng.calls[call.ID()].callerTransportBusy
+	eng.mu.Unlock()
+	if !sent || busy {
+		t.Fatalf("caller transport state = (sent=%t busy=%t), want (true false)", sent, busy)
+	}
+}
+
+func TestOutgoingAcceptCallerTransportGuardsAndDoesNotHoldEngineMutex(t *testing.T) {
+	answeringDevice := peerJID()
+	answeringDevice.Device = 7
+
+	t.Run("sender runs outside engine mutex", func(t *testing.T) {
+		eng, call := testEngineWithOutgoingCall()
+		eng.sendCallNode = func(_ context.Context, _ waBinary.Node) error {
+			acquired := make(chan struct{})
+			go func() {
+				eng.mu.Lock()
+				close(acquired)
+				eng.mu.Unlock()
+			}()
+			select {
+			case <-acquired:
+				return nil
+			case <-time.After(time.Second):
+				t.Fatal("caller transport send held engine mutex")
+				return nil
+			}
+		}
+		eng.onAccept(&events.CallAccept{
+			BasicCallMeta: types.BasicCallMeta{CallID: call.ID(), From: answeringDevice},
+			Data:          &waBinary.Node{Tag: "accept"},
+		})
+	})
+
+	for _, tc := range []struct {
+		name   string
+		mutate func(*engine, *Call)
+	}{
+		{name: "inbound", mutate: func(e *engine, _ *Call) { e.calls["CID"].direction = CallDirectionIncoming }},
+		{name: "group", mutate: func(e *engine, _ *Call) { e.calls["CID"].group = true }},
+		{name: "ended", mutate: func(_ *engine, c *Call) { c.setPhase(CallPhaseEnded) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			eng, call := testEngineWithOutgoingCall()
+			tc.mutate(eng, call)
+			attempts := 0
+			eng.sendCallNode = func(context.Context, waBinary.Node) error { attempts++; return nil }
+			eng.onAccept(&events.CallAccept{
+				BasicCallMeta: types.BasicCallMeta{CallID: call.ID(), From: answeringDevice},
+				Data:          &waBinary.Node{Tag: "accept"},
+			})
+			if attempts != 0 {
+				t.Fatalf("caller transport attempts = %d, want 0", attempts)
+			}
+		})
+	}
+
+	t.Run("accept without answering device", func(t *testing.T) {
+		eng, call := testEngineWithOutgoingCall()
+		attempts := 0
+		eng.sendCallNode = func(context.Context, waBinary.Node) error { attempts++; return nil }
+		eng.onAccept(&events.CallAccept{
+			BasicCallMeta: types.BasicCallMeta{CallID: call.ID()},
+			Data:          &waBinary.Node{Tag: "accept"},
+		})
+		if attempts != 0 {
+			t.Fatalf("caller transport attempts without device = %d, want 0", attempts)
+		}
+	})
+}
+
+func TestCallerTransportDoesNotSurviveFinishDuringSend(t *testing.T) {
+	eng, call := testEngineWithOutgoingCall()
+	answeringDevice := peerJID()
+	answeringDevice.Device = 7
+	attempts := 0
+	eng.sendCallNode = func(_ context.Context, _ waBinary.Node) error {
+		attempts++
+		eng.finishCall(call.ID(), "test end during transport")
+		return nil
+	}
+	event := &events.CallAccept{
+		BasicCallMeta: types.BasicCallMeta{CallID: call.ID(), From: answeringDevice},
+		Data:          &waBinary.Node{Tag: "accept"},
+	}
+	eng.onAccept(event)
+	eng.onAccept(event)
+	if attempts != 1 {
+		t.Fatalf("caller transport attempts after finish = %d, want 1", attempts)
+	}
+	if eng.lookup(call.ID()) != nil || call.State() != CallPhaseEnded {
+		t.Fatal("caller transport revived a call that ended during send")
+	}
+}
+
+func TestCallerTransportAcceptAndFinishRace(t *testing.T) {
+	for attempt := 0; attempt < 64; attempt++ {
+		eng, call := testEngineWithOutgoingCall()
+		answeringDevice := peerJID()
+		answeringDevice.Device = 7
+		entered := make(chan struct{})
+		release := make(chan struct{})
+		eng.sendCallNode = func(_ context.Context, _ waBinary.Node) error {
+			close(entered)
+			<-release
+			return nil
+		}
+		done := make(chan struct{})
+		go func() {
+			eng.onAccept(&events.CallAccept{
+				BasicCallMeta: types.BasicCallMeta{CallID: call.ID(), From: answeringDevice},
+				Data:          &waBinary.Node{Tag: "accept"},
+			})
+			close(done)
+		}()
+		<-entered
+		finished := make(chan struct{})
+		go func() {
+			eng.finishCall(call.ID(), "test concurrent finish")
+			close(finished)
+		}()
+		<-finished
+		close(release)
+		<-done
+		if eng.lookup(call.ID()) != nil || call.State() != CallPhaseEnded {
+			t.Fatalf("iteration %d: accept revived a finished call", attempt)
+		}
+	}
+}
+
+func TestCallerTransportConcurrentAcceptsSendOnce(t *testing.T) {
+	eng, call := testEngineWithOutgoingCall()
+	answeringDevice := peerJID()
+	answeringDevice.Device = 7
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	attempts := 0
+	eng.sendCallNode = func(_ context.Context, _ waBinary.Node) error {
+		attempts++
+		close(entered)
+		<-release
+		return nil
+	}
+	event := &events.CallAccept{
+		BasicCallMeta: types.BasicCallMeta{CallID: call.ID(), From: answeringDevice},
+		Data:          &waBinary.Node{Tag: "accept"},
+	}
+	firstDone := make(chan struct{})
+	go func() { eng.onAccept(event); close(firstDone) }()
+	<-entered
+	secondDone := make(chan struct{})
+	go func() { eng.onAccept(event); close(secondDone) }()
+	select {
+	case <-secondDone:
+	case <-time.After(time.Second):
+		t.Fatal("duplicate accept waited for the in-flight caller transport")
+	}
+	close(release)
+	<-firstDone
+	if attempts != 1 {
+		t.Fatalf("concurrent caller transport attempts = %d, want 1", attempts)
+	}
+}
+
 func TestOutgoingAcceptRekeysToAnsweringDevice(t *testing.T) {
 	eng, call := testEngineWithOutgoingCall()
 	m := eng.calls[call.ID()]
