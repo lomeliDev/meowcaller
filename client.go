@@ -24,6 +24,7 @@ type Client struct {
 	diag              *diag.Recorder
 	eng               *engine
 	mediaOffload      MediaOffloadFunc
+	mediaOffloadRekey MediaOffloadRekeyFunc
 	mediaGroupOffload MediaGroupOffloadFunc
 
 	getGroupInfo func(context.Context, types.JID) (*types.GroupInfo, error)
@@ -54,7 +55,7 @@ type GroupCallOptions struct {
 func NewClient(wa *whatsmeow.Client, opts ...Option) *Client {
 	cfg := resolveConfig(opts)
 	c := &Client{
-		wa: wa, log: cfg.log, diag: cfg.diag, mediaOffload: cfg.mediaOffload,
+		wa: wa, log: cfg.log, diag: cfg.diag, mediaOffload: cfg.mediaOffload, mediaOffloadRekey: cfg.mediaOffloadRekey,
 		mediaGroupOffload: cfg.mediaGroupOffload,
 		getGroupInfo:      wa.GetGroupInfo,
 		ownGroupJIDs: func() []types.JID {

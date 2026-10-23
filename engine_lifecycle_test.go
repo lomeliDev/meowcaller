@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/purpshell/meowcaller/signaling"
 	"go.mau.fi/whatsmeow"
@@ -549,6 +550,135 @@ func TestOutgoingPeerAcceptDoesNotRegressActiveCall(t *testing.T) {
 	})
 	if got := call.State(); got != CallPhaseActive {
 		t.Fatalf("phase = %d, want Active", got)
+	}
+}
+
+func TestOffloadedAcceptForwardsAnsweringPeerToConsumer(t *testing.T) {
+	for _, mediaAlreadyStarted := range []bool{false, true} {
+		t.Run(map[bool]string{false: "accept-antes-de-media", true: "media-antes-de-accept"}[mediaAlreadyStarted], func(t *testing.T) {
+			eng, call := testEngineWithOutgoingCall()
+			m := eng.calls[call.ID()]
+			m.started = mediaAlreadyStarted
+			m.peerLID = types.NewJID("222222222222222", types.HiddenUserServer).String()
+			eng.c.mediaOffload = func(MediaSetup) error { return nil }
+			var got []string
+			eng.c.mediaOffloadRekey = func(callID, peer string) error {
+				if callID != call.ID() {
+					t.Fatalf("callID = %q, want %q", callID, call.ID())
+				}
+				got = append(got, peer)
+				return nil
+			}
+			device := types.NewADJID("222222222222222", 0, 7)
+
+			eng.onAccept(&events.CallAccept{
+				BasicCallMeta: types.BasicCallMeta{CallID: call.ID(), From: device},
+				Data:          &waBinary.Node{Tag: "accept"},
+			})
+			eng.onAccept(&events.CallAccept{
+				BasicCallMeta: types.BasicCallMeta{CallID: call.ID(), From: device},
+				Data:          &waBinary.Node{Tag: "accept"},
+			})
+
+			if len(got) != 1 || got[0] != device.String() {
+				t.Fatalf("offload rekeys = %v, want [%q]", got, device.String())
+			}
+		})
+	}
+}
+
+func TestOffloadedAcceptRetriesFailedRekeyAndSkipsEndedOrGroup(t *testing.T) {
+	t.Run("retry", func(t *testing.T) {
+		eng, call := testEngineWithOutgoingCall()
+		m := eng.calls[call.ID()]
+		m.peerLID = types.NewJID("222222222222222", types.HiddenUserServer).String()
+		eng.c.mediaOffload = func(MediaSetup) error { return nil }
+		attempts := 0
+		eng.c.mediaOffloadRekey = func(string, string) error {
+			attempts++
+			if attempts == 1 {
+				return errors.New("temporary consumer failure")
+			}
+			return nil
+		}
+		device := types.NewADJID("222222222222222", 0, 7)
+		ev := &events.CallAccept{BasicCallMeta: types.BasicCallMeta{CallID: call.ID(), From: device}, Data: &waBinary.Node{Tag: "accept"}}
+		eng.onAccept(ev)
+		eng.onAccept(ev)
+		eng.onAccept(ev)
+		if attempts != 2 {
+			t.Fatalf("rekey attempts = %d, want failed attempt plus one retry", attempts)
+		}
+	})
+
+	for _, tc := range []struct {
+		name    string
+		ended   bool
+		group   bool
+		offload bool
+	}{
+		{"ended", true, false, true},
+		{"group", false, true, true},
+		{"local", false, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			eng, call := testEngineWithOutgoingCall()
+			m := eng.calls[call.ID()]
+			m.group = tc.group
+			if tc.ended {
+				call.setPhase(CallPhaseEnded)
+			}
+			if tc.offload {
+				eng.c.mediaOffload = func(MediaSetup) error { return nil }
+			}
+			calls := 0
+			eng.c.mediaOffloadRekey = func(string, string) error { calls++; return nil }
+			eng.onAccept(&events.CallAccept{BasicCallMeta: types.BasicCallMeta{CallID: call.ID(), From: types.NewADJID("222222222222222", 0, 7)}, Data: &waBinary.Node{Tag: "accept"}})
+			if calls != 0 {
+				t.Fatalf("forwarded %d offload rekeys for %s call", calls, tc.name)
+			}
+		})
+	}
+}
+
+func TestOffloadedAcceptDoesNotHoldEngineLockWhileForwardingRekey(t *testing.T) {
+	eng, call := testEngineWithOutgoingCall()
+	eng.c.mediaOffload = func(MediaSetup) error { return nil }
+	eng.c.mediaOffloadRekey = func(string, string) error {
+		done := make(chan struct{})
+		go func() {
+			eng.mu.Lock()
+			eng.mu.Unlock()
+			close(done)
+		}()
+		select {
+		case <-done:
+			return nil
+		case <-time.After(time.Second):
+			t.Fatal("offload rekey callback ran while engine lock was held")
+			return nil
+		}
+	}
+	eng.onAccept(&events.CallAccept{BasicCallMeta: types.BasicCallMeta{CallID: call.ID(), From: types.NewADJID("222222222222222", 0, 7)}, Data: &waBinary.Node{Tag: "accept"}})
+}
+
+func TestOffloadedAcceptSerializesNewerPeerAfterBusyCallback(t *testing.T) {
+	eng, call := testEngineWithOutgoingCall()
+	eng.c.mediaOffload = func(MediaSetup) error { return nil }
+	first := types.NewADJID("222222222222222", 0, 7)
+	second := types.NewADJID("222222222222222", 0, 8)
+	var got []string
+	eng.c.mediaOffloadRekey = func(_ string, peer string) error {
+		got = append(got, peer)
+		if len(got) == 1 {
+			eng.onAccept(&events.CallAccept{BasicCallMeta: types.BasicCallMeta{CallID: call.ID(), From: second}, Data: &waBinary.Node{Tag: "accept"}})
+		}
+		return nil
+	}
+
+	eng.onAccept(&events.CallAccept{BasicCallMeta: types.BasicCallMeta{CallID: call.ID(), From: first}, Data: &waBinary.Node{Tag: "accept"}})
+	if len(got) != 2 || got[0] != first.String() || got[1] != second.String() {
+		t.Fatalf("serialized rekeys = %v, want [%q %q]", got, first.String(), second.String())
 	}
 }
 

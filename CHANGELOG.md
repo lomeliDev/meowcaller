@@ -7,6 +7,15 @@ All notable changes to meowcaller, tracked per module. Format loosely follows
 
 ## [Unreleased]
 
+### media/offload — `implemented`
+
+- `WithMediaOffloadRekey` is an optional callback for the session process to
+  report the peer that answered after a 1:1 media setup was handed elsewhere.
+  It is additive and nil by default. Updates are serialized per call, happen
+  outside the engine mutex, retain the newest peer during a callback, and retry
+  after a later accept if the consumer returns an error. Group, incoming, ended
+  and local-media calls do not invoke it.
+
 ### call/1to1-signaling — `implemented`
 
 - A direct outgoing call now sends its initial `mute_v2` only after relay setup

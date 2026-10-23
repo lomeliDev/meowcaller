@@ -5,14 +5,15 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// Option configures optional, non-behavioral aspects of the call/media types —
-// currently the diagnostic logger. The zero configuration logs nothing.
+// Option configures optional behavior of the call/media types. The zero
+// configuration keeps diagnostics silent and media local.
 type Option func(*config)
 
 type config struct {
 	log               zerolog.Logger
 	diag              *diag.Recorder
 	mediaOffload      MediaOffloadFunc
+	mediaOffloadRekey MediaOffloadRekeyFunc
 	mediaGroupOffload MediaGroupOffloadFunc
 }
 
