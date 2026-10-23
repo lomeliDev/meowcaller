@@ -7,6 +7,16 @@ All notable changes to meowcaller, tracked per module. Format loosely follows
 
 ## [Unreleased]
 
+### api/call-link-join — `implemented`
+
+- `CallLinkOptions.OnJoined` exposes the short synchronous point after a
+  call-link join has installed its `Call` but before its first group snapshot
+  can start media. An integration that offloads group media can register the
+  real call ID in that interval. A hook error now tears down the just-created
+  engine entry, ends the Call, and sends a terminate, so a failed handoff
+  cannot leave hidden live state or an attached remote call behind. The
+  existing no-hook path is unchanged.
+
 ### call/video — `implemented`
 
 - `Call.RequestVideoKeyframe` asks the peer for a keyframe on demand, with the

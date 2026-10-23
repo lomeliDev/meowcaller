@@ -453,6 +453,14 @@ func (e *engine) joinPublicCallLink(
 		Capability: append([]byte(nil), signaling.CapabilityOffer...),
 	}
 	e.mu.Unlock()
+	if opts.OnJoined != nil {
+		if err := opts.OnJoined(call); err != nil {
+			if cleanupErr := e.hangup(call); cleanupErr != nil {
+				return nil, fmt.Errorf("meowcaller: prepare call-link join: %w", errors.Join(err, cleanupErr))
+			}
+			return nil, fmt.Errorf("meowcaller: prepare call-link join: %w", err)
+		}
+	}
 	if result.Group != nil {
 		e.applyGroupUpdate(*result.Group)
 	}
