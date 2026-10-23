@@ -88,7 +88,10 @@ type engineCall struct {
 	invitePeerDevice  groupCallDevice
 
 	// The callee <accept> is deferred until the caller's <mute_v2> arrives.
-	acceptPending bool
+	acceptPending   bool
+	acceptMuteSeen  bool
+	initialMuteSent bool
+	initialMuteBusy bool
 }
 
 // pendingJoinGroupControl conserva un control de grupo mientras OnJoined
@@ -739,7 +742,12 @@ func (e *engine) answer(c *Call) error {
 	}
 	e.mu.Lock()
 	m.acceptPending = true
+	acceptNow := m.acceptMuteSeen
+	to, creator := m.from, m.creator
 	e.mu.Unlock()
+	if acceptNow {
+		e.sendAccept(c.id, to, creator)
+	}
 
 	c.setPhase(CallPhaseConnecting)
 	e.maybeStartMedia(c.id)
@@ -765,8 +773,8 @@ func (e *engine) sendAccept(callID string, to, creator types.JID) {
 		Metadata:   waBinary.Attrs{"peer_abtest_bucket_id_list": "125208,94276"},
 		Video:      isVideo,
 	})
-	accept.Attrs["id"] = e.c.wa.DangerousInternals().GenerateRequestID()
-	if err := e.c.wa.DangerousInternals().SendNode(context.Background(), accept); err != nil {
+	accept.Attrs["id"] = e.nextCallNodeID()
+	if err := e.transmitCallNode(context.Background(), accept); err != nil {
 		e.c.log.Error().Err(err).Str("call_id", callID).Msg("send accept failed")
 		return
 	}
@@ -839,7 +847,42 @@ func (e *engine) onRelay(callID string, data *waBinary.Node) {
 				Msg("rekeyed media to relay-elected peer")
 		}
 	}
+	e.sendInitialMute(callID)
 	e.maybeStartMedia(callID)
+}
+
+// sendInitialMute tells a direct-call callee that the caller completed relay
+// setup. The callee uses that first control to release its deferred accept.
+func (e *engine) sendInitialMute(callID string) {
+	// Source of truth: https://github.com/oxidezap/whatsapp-rust/blob/41095d4e6ba4610e054e9ede3af1d5e88a83faee/wacore/src/voip/stanza.rs#L297-L305
+	e.mu.Lock()
+	m := e.calls[callID]
+	if m == nil || m.group || m.direction != CallDirectionOutgoing || m.initialMuteSent || m.initialMuteBusy ||
+		m.call == nil || m.call.State() == CallPhaseEnded {
+		e.mu.Unlock()
+		return
+	}
+	m.initialMuteBusy = true
+	to, creator := m.from, m.creator
+	e.mu.Unlock()
+
+	node := signaling.BuildMuteV2(callID, to, creator, "0")
+	node.Attrs["id"] = e.nextCallNodeID()
+	err := e.transmitCallNode(context.Background(), node)
+
+	e.mu.Lock()
+	if current := e.calls[callID]; current == m {
+		current.initialMuteBusy = false
+		if err == nil {
+			current.initialMuteSent = true
+		}
+	}
+	e.mu.Unlock()
+	if err != nil {
+		e.c.log.Warn().Err(err).Str("call_id", callID).Msg("send initial mute_v2 failed")
+		return
+	}
+	e.c.log.Info().Str("call_id", callID).Msg("sent initial mute_v2 after relay setup")
 }
 
 // onRelayLatency answers the caller's relaylatency probes (the callee's half of the
@@ -1234,7 +1277,11 @@ func (e *engine) onCallRaw(callNode *waBinary.Node) bool {
 		// (e.g. 1→0) and must not re-run the accept path on an already-accepted call.
 		e.mu.Lock()
 		m := e.calls[callID]
-		pending := m != nil && m.acceptPending
+		first := m != nil && m.direction == CallDirectionIncoming && !m.acceptMuteSeen
+		pending := first && m.acceptPending
+		if first {
+			m.acceptMuteSeen = true
+		}
 		e.mu.Unlock()
 		if m != nil && m.call != nil {
 			if fn := m.call.onMuteStateFn(); fn != nil {
