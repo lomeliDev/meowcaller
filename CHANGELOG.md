@@ -7,6 +7,16 @@ All notable changes to meowcaller, tracked per module. Format loosely follows
 
 ## [Unreleased]
 
+### call/1to1-signaling — `implemented`
+
+- A direct outgoing call now sends its initial `mute_v2` once relay setup is
+  known. An incoming direct call latches that first control even if it arrives
+  just before `Answer`, then emits exactly one deferred accept. This lets two
+  library endpoints complete the ordinary 1:1 handshake; before it, each bot
+  could wait for a control that the other library endpoint never sent. Failed
+  initial mute sends remain retryable on a later relay notification, while
+  groups and incoming calls do not emit this control.
+
 ### api/call-link-join — `implemented`
 
 - `CallLinkOptions.OnJoined` exposes the short synchronous point after a
