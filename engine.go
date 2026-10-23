@@ -88,13 +88,16 @@ type engineCall struct {
 	invitePeerDevice  groupCallDevice
 
 	// The callee <accept> is deferred until the caller's <mute_v2> arrives.
-	acceptPending   bool
-	acceptMuteSeen  bool
-	acceptMuteFrom  types.JID
-	acceptMuteOwner types.JID
-	initialMuteSent bool
-	initialMuteBusy bool
-	initialMutePeer types.JID
+	acceptPending    bool
+	acceptMuteSeen   bool
+	acceptMuteFrom   types.JID
+	acceptMuteOwner  types.JID
+	initialMuteSent  bool
+	initialMuteBusy  bool
+	initialMutePeer  types.JID
+	offloadRekeyPeer string
+	offloadRekeyBusy bool
+	offloadRekeyNext string
 }
 
 // pendingJoinGroupControl conserva un control de grupo mientras OnJoined
@@ -1016,6 +1019,7 @@ func (e *engine) onAccept(ev *events.CallAccept) {
 	}
 	e.mu.Lock()
 	var rekeyPeer func(string) error
+	var notifyOffloadRekey bool
 	answeringPeer := ev.From.String()
 	if current := e.calls[ev.CallID]; current != nil {
 		if device, ok := inviteDeviceCapability(ev.From, ev.Data); ok {
@@ -1030,6 +1034,10 @@ func (e *engine) onAccept(ev *events.CallAccept) {
 			current.peerLID = answeringPeer
 			rekeyPeer = current.rekeyPeer
 		}
+		if answeringPeer != "" && e.c.mediaOffload != nil && e.c.mediaOffloadRekey != nil &&
+			current.offloadRekeyPeer != answeringPeer {
+			notifyOffloadRekey = true
+		}
 	}
 	e.mu.Unlock()
 	if rekeyPeer != nil {
@@ -1038,6 +1046,9 @@ func (e *engine) onAccept(ev *events.CallAccept) {
 		} else {
 			e.c.log.Info().Str("call_id", ev.CallID).Str("peer_lid", answeringPeer).Msg("rekeyed media to answering device")
 		}
+	}
+	if notifyOffloadRekey {
+		e.forwardOffloadRekey(ev.CallID, answeringPeer)
 	}
 	if m.call != nil && m.call.State() < CallPhaseConnecting {
 		m.call.setPhase(CallPhaseConnecting)
@@ -1056,6 +1067,61 @@ func (e *engine) onAccept(ev *events.CallAccept) {
 		"from": ev.From.String(), "platform": ev.RemotePlatform, "video": m.localVideo || m.remoteVideo,
 	})
 	e.maybeStartMedia(ev.CallID)
+}
+
+// forwardOffloadRekey serializes peer updates for one media consumer. The
+// callback must enqueue or otherwise return promptly; signaling never holds
+// e.mu while the consumer runs.
+func (e *engine) forwardOffloadRekey(callID, peerLID string) {
+	for {
+		e.mu.Lock()
+		m := e.calls[callID]
+		if m == nil || m.call == nil || m.call.State() == CallPhaseEnded ||
+			e.c.mediaOffload == nil || e.c.mediaOffloadRekey == nil {
+			e.mu.Unlock()
+			return
+		}
+		if m.offloadRekeyPeer == peerLID {
+			e.mu.Unlock()
+			return
+		}
+		if m.offloadRekeyBusy {
+			m.offloadRekeyNext = peerLID
+			e.mu.Unlock()
+			return
+		}
+		m.offloadRekeyBusy = true
+		callback := e.c.mediaOffloadRekey
+		e.mu.Unlock()
+
+		err := callback(callID, peerLID)
+		e.mu.Lock()
+		m = e.calls[callID]
+		if m == nil || m.offloadRekeyBusy == false {
+			e.mu.Unlock()
+			return
+		}
+		m.offloadRekeyBusy = false
+		if err != nil {
+			if m.offloadRekeyNext == "" {
+				m.offloadRekeyNext = peerLID
+			}
+			e.mu.Unlock()
+			e.c.log.Warn().Err(err).Str("call_id", callID).Str("peer_lid", peerLID).
+				Msg("failed to forward offload rekey to media consumer")
+			return
+		}
+		m.offloadRekeyPeer = peerLID
+		next := m.offloadRekeyNext
+		m.offloadRekeyNext = ""
+		e.mu.Unlock()
+		e.c.log.Info().Str("call_id", callID).Str("peer_lid", peerLID).
+			Msg("forwarded rekey to offload media consumer")
+		if next == "" || next == peerLID {
+			return
+		}
+		peerLID = next
+	}
 }
 
 func inviteDeviceCapability(device types.JID, node *waBinary.Node) (groupCallDevice, bool) {

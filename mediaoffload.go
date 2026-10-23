@@ -52,11 +52,22 @@ type RelayAddressSetup struct {
 // else. Returning an error leaves the call without media.
 type MediaOffloadFunc func(MediaSetup) error
 
+// MediaOffloadRekeyFunc reports the peer identity that answered an offloaded
+// direct call. The consumer owns the media process and applies the update there.
+type MediaOffloadRekeyFunc func(callID, peerLID string) error
+
 // WithMediaOffload diverts the 1:1 media loop out of this process. The session
 // keeps owning signaling; whoever receives the setup owns the relay transport,
 // the keying and the codec. Group calls require WithGroupMediaOffload.
 func WithMediaOffload(fn MediaOffloadFunc) Option {
 	return func(c *config) { c.mediaOffload = fn }
+}
+
+// WithMediaOffloadRekey receives later peer-identity updates for direct calls
+// whose media was handed to WithMediaOffload. Without it, those updates are
+// intentionally ignored for compatibility.
+func WithMediaOffloadRekey(fn MediaOffloadRekeyFunc) Option {
+	return func(c *config) { c.mediaOffloadRekey = fn }
 }
 
 // ErrNoRelayEndpoint reports a setup that carries no usable relay address.
