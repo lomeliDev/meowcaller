@@ -13,6 +13,15 @@ import (
 // CallLinkOptions selects an audio or video call link.
 type CallLinkOptions struct {
 	Video bool
+
+	// OnJoined runs after JoinCallLink has installed the Call in its engine but
+	// before an admitted link applies its first group snapshot and can start
+	// media. A caller that hands group media to another process uses this short
+	// synchronous window to register that process against the Call ID.
+	//
+	// Returning an error aborts the join and removes the newly installed call.
+	// CreateCallLink and PreviewCallLink ignore this callback.
+	OnJoined func(*Call) error
 }
 
 // CallLink is one reusable public call-link token and URL.

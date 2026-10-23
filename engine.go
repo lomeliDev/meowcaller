@@ -53,18 +53,31 @@ type engineCall struct {
 	creator types.JID // call-creator JID (for accept/relaylatency)
 	from    types.JID // the <call> "from" — where stanzas are addressed
 
-	direction         CallDirection
-	codec             AudioCodec   // audio codec for this call, selected from voip_settings (MLow default)
-	localVideo        bool         // this client is sending, or has requested to send, video
-	remoteVideo       bool         // the peer is sending video to this client
-	videoGate         bool         // outbound upgrade is waiting for peer acceptance
-	peerVideoUpgrade  bool         // the peer's inbound upgrade is waiting for local acceptance
-	videoTx           *videoSender // video send pipeline, live while media runs
-	appDataTx         *appDataSender
-	rekeyPeer         func(string) error
-	group             bool
-	groupUpdate       *groupCallUpdate
-	groupReceivers    *participantReceiveRegistry
+	direction           CallDirection
+	codec               AudioCodec   // audio codec for this call, selected from voip_settings (MLow default)
+	localVideo          bool         // this client is sending, or has requested to send, video
+	remoteVideo         bool         // the peer is sending video to this client
+	videoGate           bool         // outbound upgrade is waiting for peer acceptance
+	peerVideoUpgrade    bool         // the peer's inbound upgrade is waiting for local acceptance
+	videoTx             *videoSender // video send pipeline, live while media runs
+	videoRx             *videoKeyframeRequester
+	appDataTx           *appDataSender
+	rekeyPeer           func(string) error
+	group               bool
+	groupUpdate         *groupCallUpdate
+	groupReceivers      *participantReceiveRegistry
+	groupOffloaded      bool
+	groupOffloading     bool
+	groupCallbacks      GroupMediaCallbacks
+	pendingGroupUpdates []GroupMediaUpdate
+	pendingGroupEpochs  []GroupMediaEpoch
+	// joinHookPending cierra la carrera entre JoinCallLink y el primer snapshot
+	// de grupo: el integrador registra al dueño de medios con OnJoined fuera del
+	// mutex, mientras los controles que llegan en paralelo esperan aquí. No se
+	// puede sostener e.mu durante el hook porque el integrador puede volver al
+	// engine al preparar su ciclo de vida.
+	joinHookPending   bool
+	joinPendingGroup  []pendingJoinGroupControl
 	groupRawEpoch     []byte
 	groupEpochTxID    uint32
 	hasGroupEpoch     bool
@@ -76,6 +89,26 @@ type engineCall struct {
 
 	// The callee <accept> is deferred until the caller's <mute_v2> arrives.
 	acceptPending bool
+}
+
+// pendingJoinGroupControl conserva un control de grupo mientras OnJoined
+// registra el dueño de los medios. Es privado al engine: se vacía en orden al
+// terminar el hook o se descarta al terminar la llamada.
+type pendingJoinGroupControl struct {
+	update *groupCallUpdate
+	epoch  *GroupMediaEpoch
+}
+
+func clearPendingJoinGroupControls(m *engineCall) {
+	if m == nil {
+		return
+	}
+	for i := range m.joinPendingGroup {
+		if epoch := m.joinPendingGroup[i].epoch; epoch != nil {
+			clear(epoch.RawKey)
+		}
+	}
+	m.joinPendingGroup = nil
 }
 
 // newEngine creates the engine for a Client.
@@ -255,6 +288,22 @@ func (e *engine) sendVideoFrame(callID string, au []byte, duration time.Duration
 	return nil
 }
 
+// requestVideoKeyframe asks the peer to send a video keyframe now, by way of an RTCP
+// picture-loss indication on the peer's video SSRC. It is the on-demand twin of what the
+// media loop does on its own when it detects loss, and goes through the same sender.
+func (e *engine) requestVideoKeyframe(callID string) error {
+	e.mu.Lock()
+	var rx *videoKeyframeRequester
+	if m := e.calls[callID]; m != nil {
+		rx = m.videoRx
+	}
+	e.mu.Unlock()
+	if rx == nil {
+		return errors.New("meowcaller: call has no active video receiver")
+	}
+	return rx.request()
+}
+
 func (e *engine) transitionVideo(callID string, transition int) error {
 	e.mu.Lock()
 	m := e.calls[callID]
@@ -357,6 +406,13 @@ func (e *engine) setVideoEnabled(callID string, enabled bool) error {
 		} else {
 			sender.disable()
 		}
+	}
+	// A media-only engine (an offloaded call) has no signaling: the session that
+	// handed the media over owns the <video> state stanza. Here the toggle is
+	// local — the sender is the whole point — and it must not roll back as if the
+	// peer had been told and refused.
+	if e.sendCallNode == nil {
+		return nil
 	}
 	state, dec := signaling.VideoStateDisabled, ""
 	if enabled {
@@ -797,6 +853,22 @@ func (e *engine) onRelayLatency(ev *events.CallRelayLatency) {
 	if rl == nil {
 		return
 	}
+	// Only endorse relays we can actually receive on. The caller's probes
+	// routinely include its own nearest edge, which is absent from the offer
+	// and holds no tokens for us; echoing that entry back tells the caller both
+	// sides reach it, the election picks it, and the caller's media moves to a
+	// relay we were never connected to.
+	e.mu.Lock()
+	offered := map[string]bool{}
+	if m.relay != nil {
+		for i := range m.relay.endpoints {
+			if name := m.relay.endpoints[i].relayName; name != "" {
+				offered[name] = true
+			}
+		}
+	}
+	e.mu.Unlock()
+
 	var probes []rlProbe
 	for i := range rl.GetChildren() {
 		te := &rl.GetChildren()[i]
@@ -804,9 +876,14 @@ func (e *engine) onRelayLatency(ev *events.CallRelayLatency) {
 			continue
 		}
 		ag := te.AttrGetter()
+		name := ag.String("relay_name")
+		if len(offered) > 0 && !offered[name] {
+			e.c.log.Debug().Str("call_id", ev.CallID).Str("relay_name", name).Msg("skipping latency response for relay outside the offer")
+			continue
+		}
 		probes = append(probes, rlProbe{
 			latency:   decodeLatency(ag.String("latency")),
-			relayName: ag.String("relay_name"),
+			relayName: name,
 			addr:      nodeBytes(te),
 		})
 	}
@@ -959,9 +1036,31 @@ func preferQualifiedPeer(current string, signaled types.JID) string {
 }
 
 // onReject tears down an outgoing call when the peer declines it.
+//
+// One exception: a reject coming from a Meta-HOSTED sibling device of our OWN
+// account (server "hosted.lid" — e.g. the Cloud API coexistence companion,
+// platform="capi"). That is a bot declaring itself uncallable
+// (reason="uncallable"), never a human declining. Measured live: neither the
+// WhatsApp server nor the caller honor it — while event processing lagged the
+// reject sat unprocessed and those calls rang, bridged and carried audio just
+// fine — so honoring it here killed perfectly good calls the moment event
+// processing stopped lagging. Rejects from REAL sibling devices (the account
+// owner declining on their phone → rejected-elsewhere) and from the peer keep
+// ending the call exactly as before.
 func (e *engine) onReject(ev *events.CallReject) {
 	m := e.lookup(ev.CallID)
 	if m == nil {
+		return
+	}
+	if own := e.ownLID().User; own != "" && ev.From.User == own &&
+		(ev.From.Server == types.HostedLIDServer || ev.From.Server == types.HostedServer) {
+		e.c.log.Info().
+			Str("call_id", ev.CallID).
+			Str("from", ev.From.String()).
+			Msg("ignoring reject from our own hosted device")
+		e.c.diag.Emit("meta", map[string]any{
+			"event": "hosted_reject_ignored", "call_id": ev.CallID, "from": ev.From.String(),
+		})
 		return
 	}
 	e.c.log.Info().
@@ -972,6 +1071,31 @@ func (e *engine) onReject(ev *events.CallReject) {
 		"event": "peer_reject", "call_id": ev.CallID, "from": ev.From.String(),
 	})
 	e.finishCall(ev.CallID, "rejected")
+}
+
+// ownLID returns the LID JID of the account this engine runs for, or the empty
+// JID when it cannot be known (tests build engines without a whatsmeow client).
+func (e *engine) ownLID() types.JID {
+	if e == nil || e.c == nil || e.c.wa == nil {
+		return types.EmptyJID
+	}
+	return e.c.wa.Store.GetLID()
+}
+
+// jidAttr reads a JID-valued attribute that may arrive already decoded as a
+// types.JID or as a raw string. whatsmeow decodes the jid on events but the
+// jid on a raw <error> child of a call ack comes through as a string, which
+// AttrGetter().OptionalJIDOrEmpty silently turns into the empty JID.
+func jidAttr(n *waBinary.Node, key string) types.JID {
+	switch v := n.Attrs[key].(type) {
+	case types.JID:
+		return v
+	case string:
+		if j, err := types.ParseJID(v); err == nil {
+			return j
+		}
+	}
+	return types.EmptyJID
 }
 
 // rlProbe is one relay candidate from a relaylatency probe.
@@ -1010,8 +1134,33 @@ func (e *engine) applyVoipSettingsCodec(m *engineCall, node *waBinary.Node, call
 func (e *engine) onCallAck(ack *waBinary.Node) {
 	if errCode := ack.AttrGetter().String("error"); errCode != "" {
 		callID := ""
+		var failedDevice types.JID
 		if en := findChild(ack, "error"); en != nil {
 			callID = en.AttrGetter().String("call-id")
+			failedDevice = jidAttr(en, "jid")
+		}
+		// An error on our ACCEPT ack is NOT fatal. On a number enrolled in
+		// coexistence (a Meta-hosted Cloud API bridge lives on the account), the
+		// server acks a companion's accept with error="500" naming a device on
+		// the account that could not be brought into the call. WhatsApp Web
+		// receives the identical error and IGNORES it: measured in the decrypted
+		// WSS, right after the error="500" it sends transport/mute_v2 and the
+		// call carries media for its full 7.8s. Killing our leg here (finishCall
+		// "server:500") is exactly why a coexistence number could not answer on a
+		// companion — and the device named is not even a reliable "us vs sibling"
+		// signal (after a re-pair it can be our own device). Offer-ack errors
+		// (outbound call placement) are a different stanza and stay fatal below.
+		if ack.AttrGetter().String("type") == "accept" {
+			e.c.log.Info().
+				Str("call_id", callID).
+				Str("error_code", errCode).
+				Str("device", failedDevice.String()).
+				Msg("ignoring accept-ack server error")
+			e.c.diag.Emit("meta", map[string]any{
+				"event": "accept_ack_error_ignored", "call_id": callID,
+				"error_code": errCode, "device": failedDevice.String(),
+			})
+			return
 		}
 		e.c.log.Warn().Str("call_id", callID).Str("error_code", errCode).Msg("call rejected by server")
 		e.finishCall(callID, "server:"+errCode)
@@ -1254,6 +1403,7 @@ func (e *engine) finishCall(callID, reason string) {
 		m.waitingRoomCancel = nil
 		clear(m.groupRawEpoch)
 		m.groupRawEpoch = nil
+		clearPendingJoinGroupControls(m)
 		receivers = m.groupReceivers
 		m.groupReceivers = nil
 		call = m.call

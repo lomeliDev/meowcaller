@@ -7,6 +7,61 @@ All notable changes to meowcaller, tracked per module. Format loosely follows
 
 ## [Unreleased]
 
+### api/call-link-join — `implemented`
+
+- `CallLinkOptions.OnJoined` exposes the short synchronous point after a
+  call-link join has installed its `Call` but before its first group snapshot
+  can start media. An integration that offloads group media can register the
+  real call ID in that interval. A hook error now tears down the just-created
+  engine entry, ends the Call, and sends a terminate, so a failed handoff
+  cannot leave hidden live state or an attached remote call behind. The
+  existing no-hook path is unchanged. Group snapshots and epochs that arrive
+  concurrently while the hook runs are queued, and media cannot begin until
+  the hook succeeds; a failed hook discards that queue.
+
+### call/video — `implemented`
+
+- `Call.RequestVideoKeyframe` asks the peer for a keyframe on demand, with the
+  same RTCP picture-loss indication the media loop already sends when the
+  H.264 assembler detects loss. Both callers now go through one
+  `videoKeyframeRequester`, so the SRTCP protection and the 300 ms per-SSRC
+  throttle are written once instead of twice. A request that arrives before
+  the peer's first video packet has no media SSRC to name, so it is armed and
+  fires on that first packet; a call with no media loop running reports it
+  instead of failing silently. Without this, anything consuming the peer's
+  video that joins mid-stream stays black until the peer's own IDR cadence
+  comes round, which can be seconds.
+
+### media/offload — `implemented`
+
+- `MediaSetup.Video` carries the negotiated video state to the offloaded media
+  process, which marks the call with both video directions enabled (as
+  `onOffer` does in the session) so the video sender is born active. Before,
+  the offloaded engine started every call as audio-only and `SendVideo`
+  dropped each access unit silently: no error, no RTP on the video SSRC, a
+  peer that never asked for a keyframe. `SetVideoEnabled` on an engine without
+  signaling now toggles the sender locally and returns nil instead of
+  transmitting a `<video>` stanza it cannot send and rolling the sender back
+  as if the peer had refused; the session that handed the media over owns the
+  signaling.
+
+### media/relay-fanout — `implemented`
+
+- Bind and allocate on every relay in the offer for 1:1 calls, broadcast
+  outbound packets to all of them, and merge inbound behind an (SSRC, seq)
+  replay filter; the keepalive re-sends each relay its own allocate. Phones
+  run client-side relay election shortly after accept and move their media to
+  the offered relay they measured closest, so a callee bound to a single
+  relay goes deaf 5–8 comfort-noise packets in (#21, #22); web callers never
+  migrate, which is why single-relay binding appeared to work from WhatsApp
+  Web. relaylatency probes are now answered only for relays present in the
+  offer, so the election cannot settle on the caller's own nearest edge — a
+  relay the callee holds no tokens for. Group calls keep the previous
+  single-relay semantics. Live-validated against Android (consumer and
+  Business), iPhone, and web callers; the live relay hop has no KAT vector,
+  matching the validation state of the existing relay code.
+
+
 ### media/group-runtime — `KAT-verified`
 
 - Hardened live group-call teardown by closing and detaching audio endpoints,
@@ -1480,3 +1535,28 @@ Entry template (newest first), grouped by module:
 - implemented: ParseSmplTOC body.
 - scaffolded: SmplTOC type + ParseSmplTOC signature + KAT test.
 -->
+
+### media/group-offload — `KAT-verified`
+
+- The offloaded worker marks media-loop ownership at construction, so the first
+  forwarded roster or epoch update cannot start a second loop. Regression tests
+  cover both control paths. The epoch/key snapshot test checks the paired-value
+  invariant; its concurrent schedule does not reliably reproduce the old
+  nanosecond-sized race window.
+- Added the serializable group media setup/update contract and an offloaded group
+  call that seeds the receiver registry from its initial roster and decrypted
+  epoch. Cross-path tests compare the derived participant SRTP keys and verify
+  epochs arriving before their roster remain pending until the matching update.
+- The engine offload hook forwards authoritative roster and epoch changes, and
+  a group without `WithGroupMediaOffload` continues on the local media path;
+  the 1:1 offload callback does not capture it. Control updates arriving while
+  the initial handoff is opening are buffered and forwarded after callbacks are
+  installed.
+- Group setup now carries the call's inbound direction through relay selection
+  and `Run`. The handoff snapshots its epoch key and transaction together, and
+  `Run` snapshots the epoch, LIDs, and relay under the engine lock. Tests cover
+  direction preservation, matching epoch/key snapshots, and concurrent rotation.
+- Added the opt-in `WithGroupMediaOffload` engine seam. Group setup is handed
+  off only when configured; subsequent authoritative roster and decrypted epoch
+  updates are forwarded through explicit callbacks. The existing 1:1 offload
+  path remains unchanged, and groups without the new option stay local.

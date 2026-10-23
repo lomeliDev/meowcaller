@@ -2,8 +2,13 @@ package meowcaller
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"testing"
 
+	"go.mau.fi/whatsmeow"
+	waBinary "go.mau.fi/whatsmeow/binary"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 )
 
@@ -190,6 +195,216 @@ func TestCallLinkTokenNormalizationAndPublicURL(t *testing.T) {
 		if _, err = normalizeCallLinkToken(invalid); err == nil {
 			t.Fatalf("accepted invalid call link %q", invalid)
 		}
+	}
+}
+
+func TestJoinCallLinkRunsHookBeforeApplyingFirstGroupSnapshot(t *testing.T) {
+	eng := engineForCallLinkJoin(t, callLinkJoinGroupAck())
+	called := false
+	call, err := eng.joinPublicCallLink(context.Background(), "TOKEN", CallLinkOptions{
+		OnJoined: func(call *Call) error {
+			called = true
+			if call == nil || call.ID() != "CID" {
+				t.Fatalf("hook recibió call = %#v", call)
+			}
+			eng.mu.Lock()
+			entry := eng.calls["CID"]
+			eng.mu.Unlock()
+			if entry == nil || entry.call != call {
+				t.Fatal("el hook corrió antes de instalar la llamada")
+			}
+			if entry.groupUpdate != nil {
+				t.Fatal("el hook corrió después de aplicar el primer snapshot de grupo")
+			}
+			return nil
+		},
+	})
+	if err != nil || call == nil || !called {
+		t.Fatalf("join = (%#v, %v), hook=%v", call, err, called)
+	}
+	eng.mu.Lock()
+	update := eng.calls["CID"].groupUpdate
+	eng.mu.Unlock()
+	if update == nil || update.CallID != "CID" {
+		t.Fatalf("el snapshot de grupo no se aplicó tras el hook: %#v", update)
+	}
+}
+
+func TestJoinCallLinkWithoutHookPreservesExistingJoin(t *testing.T) {
+	eng := engineForCallLinkJoin(t, callLinkJoinGroupAck())
+	call, err := eng.joinPublicCallLink(context.Background(), "TOKEN", CallLinkOptions{})
+	if err != nil || call == nil {
+		t.Fatalf("join sin hook = (%#v, %v)", call, err)
+	}
+	eng.mu.Lock()
+	entry := eng.calls["CID"]
+	eng.mu.Unlock()
+	if entry == nil || entry.call != call || entry.groupUpdate == nil {
+		t.Fatalf("join sin hook no conservó el estado previo: %#v", entry)
+	}
+}
+
+func TestJoinCallLinkHookFailureCleansUpInstalledCall(t *testing.T) {
+	eng := engineForCallLinkJoin(t, callLinkJoinGroupAck())
+	terminated := false
+	eng.sendCallNode = func(context.Context, waBinary.Node) error {
+		terminated = true
+		return nil
+	}
+	want := errors.New("no hay worker disponible")
+	var ended string
+	call, err := eng.joinPublicCallLink(context.Background(), "TOKEN", CallLinkOptions{
+		OnJoined: func(call *Call) error {
+			call.OnEnd(func(reason string) { ended = reason })
+			return want
+		},
+	})
+	if call != nil || !errors.Is(err, want) {
+		t.Fatalf("join = (%#v, %v), esperaba el error del hook", call, err)
+	}
+	eng.mu.Lock()
+	_, remains := eng.calls["CID"]
+	eng.mu.Unlock()
+	if remains {
+		t.Fatal("el join fallido dejó la llamada instalada en el engine")
+	}
+	if ended != "hangup" {
+		t.Fatalf("el hook fallido no cerró el Call: reason=%q", ended)
+	}
+	if !terminated {
+		t.Fatal("el hook fallido no terminó la llamada ante WhatsApp")
+	}
+}
+
+func TestJoinCallLinkDefersConcurrentGroupMediaUntilHookReturns(t *testing.T) {
+	eng := engineForCallLinkJoin(t, callLinkJoinGroupAck())
+	setup := testGroupMediaSetup(t)
+	setup.CallID = "CID"
+	update, err := groupUpdateFromMediaSetup(setup)
+	if err != nil {
+		t.Fatalf("preparar update de grupo: %v", err)
+	}
+	offloaded := make(chan GroupMediaSetup, 1)
+	eng.c.mediaGroupOffload = func(got GroupMediaSetup) (GroupMediaCallbacks, error) {
+		offloaded <- got
+		return GroupMediaCallbacks{
+			OnGroupUpdate: func(GroupMediaUpdate) error { return nil },
+			OnGroupEpoch:  func(uint32, []byte) error { return nil },
+		}, nil
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	joined := make(chan error, 1)
+	go func() {
+		_, err := eng.joinPublicCallLink(context.Background(), "TOKEN", CallLinkOptions{
+			OnJoined: func(*Call) error {
+				close(entered)
+				<-release
+				return nil
+			},
+		})
+		joined <- err
+	}()
+	<-entered
+	if !eng.applyGroupUpdate(update) {
+		t.Fatal("el update concurrente no se aceptó para diferirlo")
+	}
+	if err = eng.installGroupEpoch("CID", setup.Epoch.TransactionID, setup.Epoch.RawKey); err != nil {
+		t.Fatalf("diferir epoch concurrente: %v", err)
+	}
+	eng.mu.Lock()
+	entry := eng.calls["CID"]
+	installed := entry != nil && entry.groupUpdate != nil
+	started := entry != nil && entry.started
+	pending := 0
+	if entry != nil {
+		pending = len(entry.joinPendingGroup)
+	}
+	eng.mu.Unlock()
+	if installed || started || pending != 2 {
+		t.Fatalf("el hook bloqueado dejó estado activo: installed=%v started=%v pending=%d", installed, started, pending)
+	}
+	select {
+	case <-offloaded:
+		t.Fatal("los medios arrancaron antes de que regresara el hook")
+	default:
+	}
+	close(release)
+	if err = <-joined; err != nil {
+		t.Fatalf("join tras liberar el hook: %v", err)
+	}
+	got := <-offloaded
+	if got.CallID != "CID" || got.Epoch.TransactionID != setup.Epoch.TransactionID {
+		t.Fatalf("offload después del hook = %#v", got)
+	}
+}
+
+func TestJoinCallLinkHookFailureDropsDeferredGroupControls(t *testing.T) {
+	eng := engineForCallLinkJoin(t, callLinkJoinGroupAck())
+	setup := testGroupMediaSetup(t)
+	setup.CallID = "CID"
+	update, err := groupUpdateFromMediaSetup(setup)
+	if err != nil {
+		t.Fatalf("preparar update de grupo: %v", err)
+	}
+	eng.sendCallNode = func(context.Context, waBinary.Node) error { return nil }
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	joined := make(chan error, 1)
+	want := errors.New("registro de worker falló")
+	go func() {
+		_, err := eng.joinPublicCallLink(context.Background(), "TOKEN", CallLinkOptions{
+			OnJoined: func(*Call) error {
+				close(entered)
+				<-release
+				return want
+			},
+		})
+		joined <- err
+	}()
+	<-entered
+	if !eng.applyGroupUpdate(update) {
+		t.Fatal("el update concurrente no se difirió")
+	}
+	if err = eng.installGroupEpoch("CID", setup.Epoch.TransactionID, setup.Epoch.RawKey); err != nil {
+		t.Fatalf("diferir epoch concurrente: %v", err)
+	}
+	close(release)
+	if err = <-joined; !errors.Is(err, want) {
+		t.Fatalf("join con hook fallido: %v", err)
+	}
+	eng.mu.Lock()
+	_, remains := eng.calls["CID"]
+	eng.mu.Unlock()
+	if remains {
+		t.Fatal("el hook fallido dejó controles diferidos o llamada viva")
+	}
+}
+
+func engineForCallLinkJoin(t *testing.T, ack waBinary.Node) *engine {
+	t.Helper()
+	client := &Client{wa: &whatsmeow.Client{Store: &store.Device{
+		LID: types.NewJID("100001", types.HiddenUserServer),
+	}}}
+	eng := newEngine(client)
+	client.eng = eng
+	eng.requestCallNode = func(context.Context, waBinary.Node, string) (*waBinary.Node, error) {
+		return &ack, nil
+	}
+	return eng
+}
+
+func callLinkJoinGroupAck() waBinary.Node {
+	creator := types.NewJID("200002", types.HiddenUserServer)
+	return waBinary.Node{
+		Tag: "ack", Attrs: waBinary.Attrs{"class": "call", "type": "link_join"},
+		Content: []waBinary.Node{{
+			Tag: "group_info",
+			Attrs: waBinary.Attrs{
+				"call-id": "CID", "call-creator": creator, "transaction-id": "5",
+				"media": "audio", "connected-limit": "8",
+			},
+		}},
 	}
 }
 

@@ -150,6 +150,46 @@ func callControlParticipant(envelope *signaling.CallControlEnvelope) types.JID {
 }
 
 func (e *engine) applyGroupUpdate(update groupCallUpdate) bool {
+	return e.applyGroupUpdateWithJoinBarrier(update, false)
+}
+
+// applyGroupUpdateFromJoin instala el snapshot que acompaña al ACK de join
+// después de que OnJoined terminó, pero antes de drenar los controles que
+// llegaron mientras el hook estaba corriendo.
+func (e *engine) applyGroupUpdateFromJoin(update groupCallUpdate) bool {
+	return e.applyGroupUpdateWithJoinBarrier(update, true)
+}
+
+// releaseCallLinkJoinHook abre el paso de controles que llegaron mientras el
+// integrador preparaba el dueño de medios. Se drenan en el mismo orden en que
+// entraron; nunca bajo e.mu porque aplicar un update puede arrancar medios.
+func (e *engine) releaseCallLinkJoinHook(callID string) {
+	e.mu.Lock()
+	m := e.calls[callID]
+	if m == nil {
+		e.mu.Unlock()
+		return
+	}
+	m.joinHookPending = false
+	pending := m.joinPendingGroup
+	m.joinPendingGroup = nil
+	e.mu.Unlock()
+
+	for i := range pending {
+		control := pending[i]
+		if control.update != nil {
+			e.applyGroupUpdate(*control.update)
+			continue
+		}
+		if control.epoch != nil {
+			_ = e.installGroupEpoch(callID, control.epoch.TransactionID, control.epoch.RawKey)
+			clear(control.epoch.RawKey)
+		}
+	}
+	e.maybeStartMedia(callID)
+}
+
+func (e *engine) applyGroupUpdateWithJoinBarrier(update groupCallUpdate, fromJoin bool) bool {
 	// Source of truth: https://github.com/purpshell/meowcaller/blob/65b1dbf33f365db7392e438c3e3bf3651decb6cf/datasheets/group-media-receive.md#L83-L100
 	if update.CallID == "" {
 		return false
@@ -168,11 +208,20 @@ func (e *engine) applyGroupUpdate(update groupCallUpdate) bool {
 		e.mu.Unlock()
 		return false
 	}
+	if m.joinHookPending && !fromJoin {
+		stored := cloneGroupCallUpdate(update)
+		m.joinPendingGroup = append(m.joinPendingGroup, pendingJoinGroupControl{update: &stored})
+		e.mu.Unlock()
+		return true
+	}
 	stored := cloneGroupCallUpdate(update)
 	receivers := m.groupReceivers
+	offloaded := m.groupOffloaded
+	offloading := m.groupOffloading
+	callbacks := m.groupCallbacks
 	e.mu.Unlock()
 
-	if receivers != nil {
+	if receivers != nil && !offloaded && !offloading {
 		if err := receivers.ApplyGroupUpdate(stored); err != nil {
 			e.c.log.Warn().Err(err).Str("call_id", update.CallID).Msg("apply group media roster failed")
 			return false
@@ -199,9 +248,31 @@ func (e *engine) applyGroupUpdate(update groupCallUpdate) bool {
 	}
 	m.from = types.NewJID(update.CallID, "call")
 	call := m.call
+	selfLID := m.selfLID
+	inbound := m.direction == CallDirectionIncoming
+	offloaded = m.groupOffloaded
+	callbacks = m.groupCallbacks
+	if m.groupOffloading && !m.groupOffloaded {
+		setup := groupMediaSetupFrom(update.CallID, selfLID, inbound, 0, nil, stored)
+		m.pendingGroupUpdates = append(m.pendingGroupUpdates, GroupMediaUpdate{
+			TransactionID: stored.TransactionID, Roster: setup.Roster, Relay: setup.Relay,
+			RekeySeen: stored.RekeyRequested,
+		})
+	}
 	waitingRoomCancel := m.waitingRoomCancel
 	m.waitingRoomCancel = nil
 	e.mu.Unlock()
+	if offloaded && callbacks.OnGroupUpdate != nil {
+		setup := groupMediaSetupFrom(update.CallID, selfLID, inbound, 0, nil, stored)
+		if err := callbacks.OnGroupUpdate(GroupMediaUpdate{
+			TransactionID: stored.TransactionID, Roster: setup.Roster, Relay: setup.Relay,
+			RekeySeen: stored.RekeyRequested,
+		}); err != nil {
+			e.c.log.Warn().Err(err).Str("call_id", update.CallID).Msg("forward group media roster failed")
+		}
+	} else if offloaded {
+		e.c.log.Warn().Str("call_id", update.CallID).Msg("group media roster callback is unavailable")
+	}
 	e.c.log.Debug().
 		Str("call_id", update.CallID).
 		Uint32("transaction_id", update.TransactionID).
@@ -273,6 +344,12 @@ func (e *engine) installGroupEpoch(callID string, transactionID uint32, rawKey [
 		e.mu.Unlock()
 		return fmt.Errorf("meowcaller: unknown group call %s", callID)
 	}
+	if m.joinHookPending {
+		epoch := GroupMediaEpoch{TransactionID: transactionID, RawKey: bytes.Clone(rawKey)}
+		m.joinPendingGroup = append(m.joinPendingGroup, pendingJoinGroupControl{epoch: &epoch})
+		e.mu.Unlock()
+		return nil
+	}
 	if m.hasGroupEpoch {
 		switch {
 		case transactionID < m.groupEpochTxID:
@@ -287,7 +364,44 @@ func (e *engine) installGroupEpoch(callID string, transactionID uint32, rawKey [
 		}
 	}
 	receivers := m.groupReceivers
+	offloaded := m.groupOffloaded
+	offloading := m.groupOffloading
+	callbacks := m.groupCallbacks
 	e.mu.Unlock()
+	if offloaded {
+		if callbacks.OnGroupEpoch != nil {
+			if err := callbacks.OnGroupEpoch(transactionID, bytes.Clone(rawKey)); err != nil {
+				return err
+			}
+			e.mu.Lock()
+			if current := e.calls[callID]; current != nil && current.group {
+				if transactionID > current.groupEpochTxID {
+					clear(current.groupRawEpoch)
+					current.groupRawEpoch = bytes.Clone(rawKey)
+					current.groupEpochTxID = transactionID
+					current.hasGroupEpoch = true
+				}
+			}
+			e.mu.Unlock()
+			return nil
+		}
+		return errors.New("meowcaller: group media epoch callback is unavailable")
+	}
+	if offloading {
+		e.mu.Lock()
+		if current := e.calls[callID]; current != nil && current.group &&
+			transactionID > current.groupEpochTxID {
+			clear(current.groupRawEpoch)
+			current.groupRawEpoch = bytes.Clone(rawKey)
+			current.groupEpochTxID = transactionID
+			current.hasGroupEpoch = true
+			current.pendingGroupEpochs = append(current.pendingGroupEpochs, GroupMediaEpoch{
+				TransactionID: transactionID, RawKey: bytes.Clone(rawKey),
+			})
+		}
+		e.mu.Unlock()
+		return nil
+	}
 	if receivers != nil {
 		if err := receivers.ApplyGroupRawEpoch(transactionID, rawKey); err != nil {
 			return err

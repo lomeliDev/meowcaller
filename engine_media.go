@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -43,7 +44,7 @@ type videoReceiveState struct {
 func (e *engine) maybeStartMedia(callID string) {
 	e.mu.Lock()
 	m := e.calls[callID]
-	if m == nil || m.started {
+	if m == nil || m.started || m.joinHookPending {
 		e.mu.Unlock()
 		return
 	}
@@ -86,14 +87,89 @@ func (e *engine) maybeStartMedia(callID string) {
 	m.cancel = cancel
 	call := m.call
 	var callKey []byte
+	var groupUpdate groupCallUpdate
+	var groupEpoch uint32
 	if m.group {
 		callKey = append([]byte(nil), m.groupRawEpoch...)
+		groupUpdate = cloneGroupCallUpdate(*m.groupUpdate)
+		groupEpoch = m.groupEpochTxID
 	} else {
 		callKey = append([]byte(nil), m.callKey...)
 	}
 	selfLID, peerLID := m.selfLID, m.peerLID
 	inbound := m.direction == CallDirectionIncoming
+	isGroup := m.group
+	if isGroup && e.c != nil && e.c.mediaGroupOffload != nil {
+		m.groupOffloading = true
+	}
+	video := m.localVideo || m.remoteVideo
 	e.mu.Unlock()
+
+	if isGroup && e.c != nil && e.c.mediaGroupOffload != nil {
+		if groupUpdate.CallID == "" {
+			clear(callKey)
+			return
+		}
+		setup := groupMediaSetupFrom(callID, selfLID, inbound, groupEpoch, callKey, groupUpdate)
+		offload := e.c.mediaGroupOffload
+		e.c.log.Info().Str("call_id", callID).Msg("handing group media to an offload target")
+		callbacks, err := offload(setup)
+		clear(callKey)
+		if err == nil && (callbacks.OnGroupUpdate == nil || callbacks.OnGroupEpoch == nil) {
+			err = errors.New("meowcaller: group media offload callbacks are incomplete")
+		}
+		if err != nil {
+			e.mu.Lock()
+			if current := e.calls[callID]; current != nil {
+				current.groupOffloading = false
+			}
+			e.mu.Unlock()
+			e.c.log.Warn().Err(err).Str("call_id", callID).Msg("group media offload failed")
+			return
+		}
+		e.mu.Lock()
+		if current := e.calls[callID]; current != nil {
+			current.groupOffloaded = true
+			current.groupOffloading = false
+			current.groupCallbacks = callbacks
+			pendingUpdates := current.pendingGroupUpdates
+			pendingEpochs := current.pendingGroupEpochs
+			current.pendingGroupUpdates = nil
+			current.pendingGroupEpochs = nil
+			e.mu.Unlock()
+			for _, next := range pendingUpdates {
+				if callbacks.OnGroupUpdate != nil {
+					if err := callbacks.OnGroupUpdate(next); err != nil {
+						e.c.log.Warn().Err(err).Str("call_id", callID).Msg("forward buffered group roster failed")
+					}
+				}
+			}
+			for _, next := range pendingEpochs {
+				if callbacks.OnGroupEpoch != nil {
+					if err := callbacks.OnGroupEpoch(next.TransactionID, next.RawKey); err != nil {
+						e.c.log.Warn().Err(err).Str("call_id", callID).Msg("forward buffered group epoch failed")
+					}
+				}
+				clear(next.RawKey)
+			}
+		} else {
+			e.mu.Unlock()
+		}
+		return
+	}
+
+	if !isGroup && e.c != nil && e.c.mediaOffload != nil {
+		setup := mediaSetupFrom(callID, callKey, selfLID, peerLID, rd, inbound, video)
+		offload := e.c.mediaOffload
+		e.c.log.Info().Str("call_id", callID).Msg("handing media to an offload target")
+		go func() {
+			defer clear(callKey)
+			if err := offload(setup); err != nil {
+				e.c.log.Warn().Err(err).Str("call_id", callID).Msg("media offload failed")
+			}
+		}()
+		return
+	}
 
 	if call != nil {
 		call.setPhase(CallPhaseConnecting)
@@ -107,13 +183,91 @@ func (e *engine) maybeStartMedia(callID string) {
 	}()
 }
 
-// connectAndAllocate opens the relay DataChannel and sends the STUN allocate, returning
-// the channel and the allocate bytes (re-sent by the keepalive).
+// connectAndAllocateAll opens a relay DataChannel and sends the STUN allocate
+// on every usable relay in the offer, returning them as one fanout. Phones run
+// client relay election shortly after accept and migrate their media to the
+// offered relay they measured closest; being bound everywhere makes that
+// migration a non-event. The preferred endpoint stays first so anything with
+// primary-relay semantics (the experimental group path) is unchanged.
+//
+// multi=false preserves the original single-relay behavior (group calls).
 //
 // NOT VALIDATED: live-relay only.
-func (e *engine) connectAndAllocate(ctx context.Context, rd *relayData, streamSsrcs [9]uint32, inbound bool) (*relay.RelayMediaChannel, []byte, error) {
+func (e *engine) connectAndAllocateAll(ctx context.Context, rd *relayData, streamSsrcs [9]uint32, inbound bool, multi bool) (*relayFanout, error) {
+	primary := getMediaRelayEndpoint(rd, inbound)
+	if primary == nil || len(primary.addresses) == 0 {
+		return nil, fmt.Errorf("relay has no usable endpoint")
+	}
+	targets := []*relayEndpoint{primary}
+	if multi {
+		seen := map[string]bool{fmt.Sprintf("%s:%d", primary.addresses[0].ipv4, primary.addresses[0].port): true}
+		for i := range rd.endpoints {
+			ep := &rd.endpoints[i]
+			if len(ep.addresses) == 0 {
+				continue
+			}
+			key := fmt.Sprintf("%s:%d", ep.addresses[0].ipv4, ep.addresses[0].port)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			targets = append(targets, ep)
+		}
+	}
+
+	// Connect every target CONCURRENTLY. Serially, one unreachable relay parks
+	// the whole call for the 12s DTLS timeout before the consent ping — and the
+	// relay bridges nothing until consent, so that is 12s of silence added to a
+	// call that would otherwise have worked, per unreachable relay. The results
+	// are re-ordered afterwards so the preferred endpoint stays first.
+	type dialed struct {
+		ch       *relay.RelayMediaChannel
+		allocate []byte
+		name     string
+	}
+	results := make([]*dialed, len(targets))
+	var wg sync.WaitGroup
+	for i, ep := range targets {
+		wg.Add(1)
+		go func(i int, ep *relayEndpoint) {
+			defer wg.Done()
+			ch, allocate, err := e.connectOneRelay(ctx, rd, ep, streamSsrcs)
+			if err != nil {
+				// Secondary relays failing is survivable; the primary failing
+				// with no fallback is not.
+				e.c.log.Warn().Err(err).Str("relay_name", ep.relayName).Msg("relay connect failed; continuing without it")
+				return
+			}
+			results[i] = &dialed{ch: ch, allocate: allocate, name: ep.relayName}
+		}(i, ep)
+	}
+	wg.Wait()
+
+	var chans []*relay.RelayMediaChannel
+	var allocs [][]byte
+	var names []string
+	for _, r := range results {
+		if r == nil {
+			continue
+		}
+		chans = append(chans, r.ch)
+		allocs = append(allocs, r.allocate)
+		names = append(names, r.name)
+	}
+	if len(chans) == 0 {
+		return nil, fmt.Errorf("no relay reachable (%d offered)", len(targets))
+	}
+	e.c.log.Info().Int("connected", len(chans)).Int("offered", len(targets)).Strs("relays", names).Msg("relay fanout established")
+	return newRelayFanout(chans, allocs, names, e.c.log), nil
+}
+
+// connectOneRelay opens the relay DataChannel and sends the STUN allocate for a
+// single endpoint, returning the channel and the allocate bytes (re-sent by the
+// keepalive).
+//
+// NOT VALIDATED: live-relay only.
+func (e *engine) connectOneRelay(ctx context.Context, rd *relayData, ep *relayEndpoint, streamSsrcs [9]uint32) (*relay.RelayMediaChannel, []byte, error) {
 	log := e.c.log
-	ep := getMediaRelayEndpoint(rd, inbound)
 	if ep == nil || len(ep.addresses) == 0 {
 		return nil, nil, fmt.Errorf("relay has no usable endpoint")
 	}
@@ -220,13 +374,35 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	if err != nil {
 		return err
 	}
-	ch, allocate, err := e.connectAndAllocate(ctx, rd, streamSsrcs, inbound)
+	e.mu.Lock()
+	isGroup := false
+	if mm := e.calls[callID]; mm != nil {
+		isGroup = mm.group
+	}
+	e.mu.Unlock()
+
+	ch, err := e.connectAndAllocateAll(ctx, rd, streamSsrcs, inbound, !isGroup)
 	if err != nil {
 		return err
 	}
 	defer ch.Close()
+
+	// The receive loop below blocks in ch.Recv (a DataChannel Read) and only checks the
+	// context between packets. Once the call ends, the relay goes quiet and no packet
+	// ever arrives to wake it: the goroutine leaked until process exit. Closing the
+	// channel is the only thing that unblocks Recv, so a watcher does exactly that when
+	// the context is canceled; watchDone keeps the watcher itself from outliving us.
+	watchDone := make(chan struct{})
+	defer close(watchDone)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = ch.Close()
+		case <-watchDone:
+		}
+	}()
 	allocateState := newGroupRelayAllocateStateWithHBHFEC(
-		allocate,
+		ch.allocs[0],
 		rd.relayKeyASCII,
 		[2]uint32{hbhFECTXSSRC, hbhFECRXSSRC},
 	)
@@ -517,7 +693,9 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 							connectedRemoteParticipantPIDs(*update, audioReceivers.selfID),
 							relayTx,
 							func(packet []byte) error {
-								_, sendErr := ch.Send(packet)
+								// Group allocations are relay-specific state; they stay
+								// on the primary relay, matching the pre-fanout behavior.
+								_, sendErr := ch.PrimarySend(packet)
 								return sendErr
 							},
 						)
@@ -539,10 +717,20 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 				}
 			}
 			if !allocateSent {
-				if err := allocateState.SendCurrent(func(packet []byte) error {
-					_, sendErr := ch.Send(packet)
-					return sendErr
-				}); err != nil {
+				// groupMode, not the isGroup snapshot taken at startup: a 1:1
+				// call can be promoted to a group mid-call, and re-sending the
+				// original 1:1 allocate would drop the participant
+				// subscriptions the group path had installed.
+				if groupMode.Load() {
+					if err := allocateState.SendCurrent(func(packet []byte) error {
+						_, sendErr := ch.PrimarySend(packet)
+						return sendErr
+					}); err != nil {
+						return
+					}
+				} else if err := ch.ResendAllocates(); err != nil {
+					// Allocates embed per-relay tokens, so each relay must be
+					// refreshed with its own payload rather than a broadcast.
 					return
 				}
 			}
@@ -631,7 +819,6 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	}()
 	videoReceiveStates := make(map[*participantAudioReceiver]*videoReceiveState)
 	appDataReceivers := make(map[*participantAudioReceiver]*appDataReceiver)
-	lastVideoPLI := make(map[uint32]time.Time)
 	var rosterGeneration uint64
 	hasRosterGeneration := false
 	var videoWirePacket, videoWireFrame uint64
@@ -652,6 +839,10 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	if err = audioReceivers.attachSRTCPSender(videoRtcp); err != nil {
 		return fmt.Errorf("attach video SRTCP sender: %w", err)
 	}
+	// One keyframe requester per call, shared by the loss-recovery path below and by
+	// Call.RequestVideoKeyframe. Registered on the call so the on-demand caller can
+	// reach it, and detached when this loop exits.
+	videoKeyframes := newVideoKeyframeRequester(videoRtcp, ch, log)
 	vsender := &videoSender{
 		pipe: txVideoPipe, stream: rtp.NewVideoRtpStream(videoSelfSsrc, defaultVideoRtpStepSamples),
 		ch: ch, ssrc: videoSelfSsrc, callID: callID, keyframeRequired: true,
@@ -678,17 +869,20 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		vsender.active = m.localVideo
 		vsender.sendGated = m.videoGate
 		m.videoTx = vsender
+		m.videoRx = videoKeyframes
 		m.appDataTx = appSender
 	}
 	e.mu.Unlock()
 	defer func() {
 		appSender.close()
+		videoKeyframes.close()
 		vsender.mu.Lock()
 		vsender.ch = nil
 		vsender.mu.Unlock()
 		e.mu.Lock()
 		if m := e.calls[callID]; m != nil {
 			m.videoTx = nil
+			m.videoRx = nil
 			m.appDataTx = nil
 		}
 		e.mu.Unlock()
@@ -804,6 +998,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 	}()
 
 	buf := make([]byte, 1500)
+	rtpDedup := newRtpReplayFilter()
 	var rtpIn, rtpSeen, unprotectFail, rtpInspect, vidIn, appDataIn, appDataUnprotectFail, videoUnprotectFail, videoFrameIn, videoSinkMissing, rtcpIn, rtcpAuthFail, groupForwardingInvalid uint64
 	for {
 		if ctx.Err() != nil {
@@ -820,7 +1015,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 					continue
 				}
 				state.assembler = rtp.H264AccessUnitAssembler{}
-				delete(lastVideoPLI, receiver.videoSSRC)
+				videoKeyframes.forgetPeerVideo(receiver.videoSSRC)
 				delete(videoReceiveStates, receiver)
 			}
 			for receiver := range appDataReceivers {
@@ -923,6 +1118,12 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		if !vok {
 			continue
 		}
+		// With bind-to-all, the same packet can arrive once per relay. A
+		// duplicate reaching the playout buffer reads as a zero timestamp delta
+		// and resets it, so drop replays before any processing.
+		if rtpDedup.Duplicate(vh.Ssrc, vh.SequenceNumber) {
+			continue
+		}
 		kind := classifyMediaPayload(vh)
 		if kind == mediaPayloadAppData {
 			media, ok := audioReceivers.UnprotectAppData(pkt)
@@ -980,6 +1181,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 				videoReceiveStates[media.receiver] = videoState
 			}
 			videoReception.Observe(vh.Ssrc, vh.SequenceNumber, vh.Timestamp, uint64(time.Now().UnixMilli()), 90000)
+			videoKeyframes.observePeerVideo(vh.Ssrc)
 			if vh.VideoExtension != nil {
 				orientation := vh.VideoExtension.DisplayOrientation()
 				if orientation != videoState.orientation {
@@ -1016,12 +1218,8 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 				vh.Marker,
 				media.Payload,
 			)
-			if recoveryNeeded && shouldSendVideoPLI(lastVideoPLI, vh.Ssrc, time.Now()) {
-				packet, feedbackErr := videoRtcp.pictureLossIndication(vh.Ssrc)
-				if feedbackErr == nil {
-					_, feedbackErr = ch.Send(packet)
-				}
-				if feedbackErr != nil {
+			if recoveryNeeded {
+				if feedbackErr := videoKeyframes.sendPLI(vh.Ssrc, time.Now()); feedbackErr != nil {
 					log.Warn().Err(feedbackErr).Uint32("ssrc", vh.Ssrc).Msg("failed to request video keyframe after RTP loss")
 				}
 			}
@@ -1277,11 +1475,17 @@ func videoRtpDurationSamples(duration time.Duration) uint32 {
 // fed encoded H.264 (e.g. from the VideoBridge / WebCodecs), not raw frames.
 //
 // NOT VALIDATED: the video send media path is unproven.
+// relayMediaSender is the write half shared by the single relay channel and the
+// fanout, so senders don't care whether one relay or all of them are behind it.
+type relayMediaSender interface {
+	Send(data []byte) (int, error)
+}
+
 type videoSender struct {
 	mu               sync.Mutex
 	pipe             *MediaPipeline
 	stream           *rtp.VideoRtpStream
-	ch               *relay.RelayMediaChannel
+	ch               relayMediaSender
 	ssrc             uint32
 	callID           string
 	frame            uint64
@@ -1378,6 +1582,125 @@ func (s *mediaSrtcpSender) groupSenderReport(stats rtp.RtcpSenderStats, nowMs ui
 		s.index++
 	}
 	return packet, err
+}
+
+// videoFeedbackChannel is the relay transport a picture-loss indication goes out on.
+// It is an interface so the requester can be exercised without a live relay.
+type videoFeedbackChannel interface {
+	Send(data []byte) (int, error)
+}
+
+// videoKeyframeRequester asks the peer for a video keyframe with an RTCP picture-loss
+// indication. Both callers go through it — the loss-recovery path in runMedia and
+// Call.RequestVideoKeyframe — so the send, the SRTCP protection and the per-SSRC throttle
+// live in ONE place instead of being written twice with two different throttles.
+//
+// A request that arrives before any peer video RTP has been seen has no media SSRC to
+// name, so it is armed and fires on the peer's first video packet. That is the ordinary
+// case for the on-demand caller: whoever needs the first IDR asks as soon as the receiving
+// path is wired, which is normally before the peer's first packet lands.
+type videoKeyframeRequester struct {
+	rtcp *mediaSrtcpSender
+	log  zerolog.Logger
+
+	peerSSRC atomic.Uint32
+	pending  atomic.Bool
+
+	mu       sync.Mutex
+	ch       videoFeedbackChannel
+	lastSent map[uint32]time.Time
+}
+
+func newVideoKeyframeRequester(rtcp *mediaSrtcpSender, ch videoFeedbackChannel, log zerolog.Logger) *videoKeyframeRequester {
+	return &videoKeyframeRequester{
+		rtcp:     rtcp,
+		ch:       ch,
+		log:      log,
+		lastSent: make(map[uint32]time.Time),
+	}
+}
+
+// observePeerVideo records the SSRC the peer sends video on and releases a keyframe
+// request that arrived before there was one. It runs once per inbound video packet, so it
+// stays lock-free unless a request is actually pending.
+func (r *videoKeyframeRequester) observePeerVideo(ssrc uint32) {
+	if r == nil || ssrc == 0 {
+		return
+	}
+	if r.peerSSRC.Load() != ssrc {
+		r.peerSSRC.Store(ssrc)
+	}
+	if r.pending.CompareAndSwap(true, false) {
+		if err := r.sendPLI(ssrc, time.Now()); err != nil {
+			r.log.Warn().Err(err).Uint32("ssrc", ssrc).
+				Msg("failed to send the deferred video keyframe request")
+		}
+	}
+}
+
+// sendPLI builds and sends one picture-loss indication for mediaSSRC, honouring the shared
+// throttle. Being throttled is not an error: the peer already has a request in flight.
+func (r *videoKeyframeRequester) sendPLI(mediaSSRC uint32, now time.Time) error {
+	r.mu.Lock()
+	ch := r.ch
+	if ch == nil {
+		r.mu.Unlock()
+		return errors.New("meowcaller: call has no active video media")
+	}
+	if !shouldSendVideoPLI(r.lastSent, mediaSSRC, now) {
+		r.mu.Unlock()
+		return nil
+	}
+	r.mu.Unlock()
+	packet, err := r.rtcp.pictureLossIndication(mediaSSRC)
+	if err != nil {
+		return err
+	}
+	_, err = ch.Send(packet)
+	return err
+}
+
+// request asks the peer for a keyframe now. With no peer video SSRC seen yet the request
+// is armed and fires on the peer's first video packet.
+func (r *videoKeyframeRequester) request() error {
+	if r == nil {
+		return errors.New("meowcaller: call has no active video receiver")
+	}
+	r.mu.Lock()
+	ch := r.ch
+	r.mu.Unlock()
+	if ch == nil {
+		return errors.New("meowcaller: call has no active video media")
+	}
+	ssrc := r.peerSSRC.Load()
+	if ssrc == 0 {
+		r.pending.Store(true)
+		return nil
+	}
+	return r.sendPLI(ssrc, time.Now())
+}
+
+// forgetPeerVideo drops the throttle entry for a participant that left the roster, so a
+// later participant reusing that SSRC is not throttled by the old one's last request.
+func (r *videoKeyframeRequester) forgetPeerVideo(ssrc uint32) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	delete(r.lastSent, ssrc)
+	r.mu.Unlock()
+	r.peerSSRC.CompareAndSwap(ssrc, 0)
+}
+
+// close detaches the relay transport when the media loop exits. A later request then
+// reports that the call has no video media instead of writing to a dead channel.
+func (r *videoKeyframeRequester) close() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.ch = nil
+	r.mu.Unlock()
 }
 
 func shouldSendVideoPLI(lastSent map[uint32]time.Time, mediaSSRC uint32, now time.Time) bool {

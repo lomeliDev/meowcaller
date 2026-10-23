@@ -686,6 +686,22 @@ func (c *Call) SendVideoWithDuration(accessUnit []byte, duration time.Duration) 
 	return c.eng.sendVideoFrame(c.id, accessUnit, duration)
 }
 
+// RequestVideoKeyframe asks the peer to send a video keyframe (IDR) now, with an RTCP
+// picture-loss indication on the peer's video SSRC. It is the same feedback the media loop
+// sends on its own when it detects loss, but on demand.
+//
+// Use it when whatever consumes the peer's video needs a fresh IDR to start decoding: an
+// H.264 stream is only decodable from a keyframe, and the peer's own IDR cadence can be
+// seconds away, so a consumer that joins mid-stream shows nothing until then. Requests are
+// throttled to one per 300 ms per SSRC, shared with the loss-recovery path. If no peer
+// video packet has arrived yet the request is armed and fires on the first one.
+//
+// It returns an error when the call has no video receiver: no media loop is running for
+// this call, or the call already ended.
+func (c *Call) RequestVideoKeyframe() error {
+	return c.eng.requestVideoKeyframe(c.id)
+}
+
 // OnReady registers a callback fired once media is flowing (relay bound, first frames
 // exchanged).
 func (c *Call) OnReady(fn func()) {
