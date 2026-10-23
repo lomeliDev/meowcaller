@@ -88,16 +88,18 @@ type engineCall struct {
 	invitePeerDevice  groupCallDevice
 
 	// The callee <accept> is deferred until the caller's <mute_v2> arrives.
-	acceptPending    bool
-	acceptMuteSeen   bool
-	acceptMuteFrom   types.JID
-	acceptMuteOwner  types.JID
-	initialMuteSent  bool
-	initialMuteBusy  bool
-	initialMutePeer  types.JID
-	offloadRekeyPeer string
-	offloadRekeyBusy bool
-	offloadRekeyNext string
+	acceptPending       bool
+	acceptMuteSeen      bool
+	acceptMuteFrom      types.JID
+	acceptMuteOwner     types.JID
+	initialMuteSent     bool
+	initialMuteBusy     bool
+	initialMutePeer     types.JID
+	callerTransportSent bool
+	callerTransportBusy bool
+	offloadRekeyPeer    string
+	offloadRekeyBusy    bool
+	offloadRekeyNext    string
 }
 
 // pendingJoinGroupControl conserva un control de grupo mientras OnJoined
@@ -1053,6 +1055,7 @@ func (e *engine) onAccept(ev *events.CallAccept) {
 	if m.call != nil && m.call.State() < CallPhaseConnecting {
 		m.call.setPhase(CallPhaseConnecting)
 	}
+	e.sendCallerTransport(ev.CallID, ev.From)
 	if m.call != nil {
 		m.call.markPeerAccepted()
 	}
@@ -1067,6 +1070,49 @@ func (e *engine) onAccept(ev *events.CallAccept) {
 		"from": ev.From.String(), "platform": ev.RemotePlatform, "video": m.localVideo || m.remoteVideo,
 	})
 	e.maybeStartMedia(ev.CallID)
+}
+
+// sendCallerTransport confirms a direct callee's accept on behalf of the
+// caller. It is signaling, so it cannot wait for an offloaded media worker.
+// The target is the device that accepted, rather than the bare peer that the
+// original offer rang.
+func (e *engine) sendCallerTransport(callID string, to types.JID) {
+	// Source of truth: https://github.com/oxidezap/whatsapp-rust/blob/9b9fdb7e5c4211cdc7c837abb6a9ae9c597e35c5/src/handlers/call.rs#L628-L642
+	if to.IsEmpty() {
+		return
+	}
+	e.mu.Lock()
+	m := e.calls[callID]
+	if m == nil || m.group || m.direction != CallDirectionOutgoing || m.callerTransportSent || m.callerTransportBusy ||
+		m.call == nil || m.call.State() == CallPhaseEnded {
+		e.mu.Unlock()
+		return
+	}
+	m.callerTransportBusy = true
+	creator := m.creator
+	e.mu.Unlock()
+
+	round, messageType := "1", "1"
+	node := signaling.BuildTransport(&signaling.TransportParams{
+		CallID: callID, To: to, CallCreator: creator,
+		P2PCandRound: &round, TransportMessageType: &messageType,
+	})
+	node.Attrs["id"] = e.nextCallNodeID()
+	err := e.transmitCallNode(context.Background(), node)
+
+	e.mu.Lock()
+	if current := e.calls[callID]; current == m {
+		current.callerTransportBusy = false
+		if err == nil && current.call != nil && current.call.State() != CallPhaseEnded {
+			current.callerTransportSent = true
+		}
+	}
+	e.mu.Unlock()
+	if err != nil {
+		e.c.log.Warn().Err(err).Str("call_id", callID).Msg("send caller transport after accept failed")
+		return
+	}
+	e.c.log.Info().Str("call_id", callID).Str("to", to.String()).Msg("sent caller transport after accept")
 }
 
 // forwardOffloadRekey serializes peer updates for one media consumer. The
