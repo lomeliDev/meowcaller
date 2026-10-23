@@ -11,6 +11,7 @@ import (
 	"github.com/rs/zerolog"
 	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
 )
 
 func engineWithIncomingCall(callID string) (*engine, *Call) {
@@ -30,6 +31,13 @@ func muteV2Received(node waBinary.Node, from types.JID) *waBinary.Node {
 	return &node
 }
 
+func preacceptDevice(callID string) *events.CallPreAccept {
+	return &events.CallPreAccept{BasicCallMeta: types.BasicCallMeta{
+		CallID: callID,
+		From:   types.NewADJID("123456789", 0, 1),
+	}}
+}
+
 // A caller implemented by this library must emit the first mute_v2 after its
 // relay arrives. The callee's accept is intentionally deferred until that
 // control, so two library endpoints otherwise both wait forever.
@@ -43,6 +51,8 @@ func TestCallerRelayEmitsInitialMuteV2(t *testing.T) {
 		return nil
 	}
 
+	preaccept := preacceptDevice(call.ID())
+	caller.onPreAccept(preaccept)
 	caller.onRelay(call.ID(), &waBinary.Node{Tag: "relay"})
 
 	if len(sent) != 1 {
@@ -55,8 +65,8 @@ func TestCallerRelayEmitsInitialMuteV2(t *testing.T) {
 	if attrs.String("call-id") != call.ID() || attrs.JID("call-creator") != creatorJID() || attrs.String("mute-state") != "0" {
 		t.Fatalf("initial mute identity = %#v", attrs)
 	}
-	if to := sent[0].AttrGetter().JID("to"); to != peerJID() {
-		t.Fatalf("initial mute target = %s, want %s", to, peerJID())
+	if to := sent[0].AttrGetter().JID("to"); to != preaccept.From {
+		t.Fatalf("initial mute target = %s, want device %s", to, preaccept.From)
 	}
 	if id := sent[0].AttrGetter().String("id"); id == "" {
 		t.Fatal("initial mute has no stanza id")
@@ -79,6 +89,7 @@ func TestInitialMuteRetriesAfterSendFailureWithoutDuplicatingSuccess(t *testing.
 		return nil
 	}
 
+	caller.onPreAccept(preacceptDevice(call.ID()))
 	caller.onRelay(call.ID(), &waBinary.Node{Tag: "relay"})
 	caller.onRelay(call.ID(), &waBinary.Node{Tag: "relay"})
 	caller.onRelay(call.ID(), &waBinary.Node{Tag: "relay"})
@@ -107,6 +118,7 @@ func TestInitialMuteSkipsIncomingAndGroupCalls(t *testing.T) {
 				sent++
 				return nil
 			}
+			eng.onPreAccept(preacceptDevice(call.ID()))
 			eng.onRelay(call.ID(), &waBinary.Node{Tag: "relay"})
 			if sent != 0 {
 				t.Fatalf("sent %d initial mutes for %s call", sent, tc.name)
@@ -134,6 +146,7 @@ func TestInitialMuteDoesNotHoldEngineLockWhileSending(t *testing.T) {
 			return nil
 		}
 	}
+	caller.onPreAccept(preacceptDevice(call.ID()))
 	caller.onRelay(call.ID(), &waBinary.Node{Tag: "relay"})
 }
 
@@ -192,22 +205,25 @@ func TestDeferredAcceptHandlesMuteBeforeOrAfterAnswer(t *testing.T) {
 				return nil
 			}
 
+			preaccept := preacceptDevice(outgoing.ID())
+			caller.onPreAccept(preaccept)
 			caller.onRelay(outgoing.ID(), &waBinary.Node{Tag: "relay"})
 			if len(mute.GetChildren()) != 1 {
 				t.Fatal("caller did not produce mute_v2")
 			}
+			mute.GetChildren()[0].Attrs["call-creator"] = types.NewJID("owner-from-mute", types.HiddenUserServer)
 			if answerFirst {
 				if err := incoming.Answer(); err != nil {
 					t.Fatalf("answer: %v", err)
 				}
-				callee.onCallRaw(muteV2Received(mute, peerJID()))
+				callee.onCallRaw(muteV2Received(mute, preaccept.From))
 			} else {
-				callee.onCallRaw(muteV2Received(mute, peerJID()))
+				callee.onCallRaw(muteV2Received(mute, preaccept.From))
 				if err := incoming.Answer(); err != nil {
 					t.Fatalf("answer: %v", err)
 				}
 			}
-			callee.onCallRaw(muteV2Received(mute, peerJID()))
+			callee.onCallRaw(muteV2Received(mute, preaccept.From))
 
 			if len(accepts) != 1 {
 				t.Fatalf("accepts = %d, want exactly one", len(accepts))
@@ -215,6 +231,43 @@ func TestDeferredAcceptHandlesMuteBeforeOrAfterAnswer(t *testing.T) {
 			if got := accepts[0].GetChildren(); len(got) != 1 || got[0].Tag != "accept" {
 				t.Fatalf("callee control = %#v, want accept", accepts[0])
 			}
+			if got := accepts[0].AttrGetter().JID("to"); got != preaccept.From {
+				t.Fatalf("accept target = %s, want mute device %s", got, preaccept.From)
+			}
+			if got := accepts[0].GetChildren()[0].AttrGetter().JID("call-creator"); got.User != "owner-from-mute" {
+				t.Fatalf("accept owner = %s, want owner from mute", got)
+			}
 		})
+	}
+}
+
+// Run 3 exposed this ordering: relay arrives before the preaccept from a
+// concrete remote device. The mute must wait for that device; the LID bare in
+// the original offer is not a safe target for the direct control.
+func TestInitialMuteWaitsForRelayAndPreacceptDevice(t *testing.T) {
+	caller, call := testEngineWithOutgoingCall()
+	caller.c.log = zerolog.Nop()
+	caller.calls[call.ID()].started = true
+	var sent []waBinary.Node
+	caller.sendCallNode = func(_ context.Context, node waBinary.Node) error {
+		sent = append(sent, node)
+		return nil
+	}
+	device := types.NewADJID("123456789", 0, 1)
+
+	caller.onRelay(call.ID(), &waBinary.Node{Tag: "relay"})
+	if len(sent) != 0 {
+		t.Fatalf("sent %d mute controls before a peer device preaccepted", len(sent))
+	}
+	caller.onPreAccept(&events.CallPreAccept{BasicCallMeta: types.BasicCallMeta{CallID: call.ID(), From: peerJID()}})
+	if len(sent) != 0 {
+		t.Fatalf("sent %d mute controls to a bare LID", len(sent))
+	}
+	caller.onPreAccept(&events.CallPreAccept{BasicCallMeta: types.BasicCallMeta{CallID: call.ID(), From: device}})
+	if len(sent) != 1 {
+		t.Fatalf("sent %d mute controls after relay plus preaccept, want one", len(sent))
+	}
+	if got := sent[0].AttrGetter().JID("to"); got != device {
+		t.Fatalf("initial mute target = %s, want preaccept device %s", got, device)
 	}
 }
