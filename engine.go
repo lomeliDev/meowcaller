@@ -969,10 +969,11 @@ func (e *engine) onPreAccept(ev *events.CallPreAccept) {
 		}
 		e.mu.Unlock()
 	}
-	// The direct control must target a device, not the bare LID used to place
-	// the offer. A device preaccept can arrive after relay allocation, so it
-	// independently retries the initial mute once both halves are known.
-	if ev.From.Device != 0 {
+	// The preaccept event, rather than the Device field, proves the target is
+	// ready: Whatsmeow represents a primary device as Device=0, indistinguishable
+	// from a bare JID after decoding. A preaccept can arrive after relay
+	// allocation, so it independently retries once both halves are known.
+	if !ev.From.IsEmpty() {
 		e.mu.Lock()
 		if current := e.calls[ev.CallID]; current != nil {
 			current.initialMutePeer = ev.From

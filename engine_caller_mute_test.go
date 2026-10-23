@@ -259,15 +259,38 @@ func TestInitialMuteWaitsForRelayAndPreacceptDevice(t *testing.T) {
 	if len(sent) != 0 {
 		t.Fatalf("sent %d mute controls before a peer device preaccepted", len(sent))
 	}
-	caller.onPreAccept(&events.CallPreAccept{BasicCallMeta: types.BasicCallMeta{CallID: call.ID(), From: peerJID()}})
-	if len(sent) != 0 {
-		t.Fatalf("sent %d mute controls to a bare LID", len(sent))
-	}
 	caller.onPreAccept(&events.CallPreAccept{BasicCallMeta: types.BasicCallMeta{CallID: call.ID(), From: device}})
 	if len(sent) != 1 {
 		t.Fatalf("sent %d mute controls after relay plus preaccept, want one", len(sent))
 	}
 	if got := sent[0].AttrGetter().JID("to"); got != device {
 		t.Fatalf("initial mute target = %s, want preaccept device %s", got, device)
+	}
+}
+
+// Whatsmeow prints a primary device (Device=0) as a bare JID. It remains a
+// concrete preaccept sender, unlike the bare target stored when the offer was
+// placed, so it must also unlock the initial mute.
+func TestInitialMuteTargetsPrimaryPreacceptWithDeviceZero(t *testing.T) {
+	caller, call := testEngineWithOutgoingCall()
+	caller.c.log = zerolog.Nop()
+	caller.calls[call.ID()].started = true
+	var sent []waBinary.Node
+	caller.sendCallNode = func(_ context.Context, node waBinary.Node) error {
+		sent = append(sent, node)
+		return nil
+	}
+	primary := types.NewJID("987654321", types.HiddenUserServer)
+
+	caller.onRelay(call.ID(), &waBinary.Node{Tag: "relay"})
+	if len(sent) != 0 {
+		t.Fatalf("sent %d mute controls before a primary preaccept", len(sent))
+	}
+	caller.onPreAccept(&events.CallPreAccept{BasicCallMeta: types.BasicCallMeta{CallID: call.ID(), From: primary}})
+	if len(sent) != 1 {
+		t.Fatalf("sent %d mute controls after primary preaccept, want one", len(sent))
+	}
+	if got := sent[0].AttrGetter().JID("to"); got != primary {
+		t.Fatalf("initial mute target = %s, want primary preaccept %s", got, primary)
 	}
 }

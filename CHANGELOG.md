@@ -10,8 +10,9 @@ All notable changes to meowcaller, tracked per module. Format loosely follows
 ### call/1to1-signaling — `implemented`
 
 - A direct outgoing call now sends its initial `mute_v2` only after relay setup
-  and a concrete peer-device preaccept are both known; it never targets the
-  bare LID used to place the offer. An incoming direct call latches the first
+  and a nonempty peer preaccept are both known; it never targets the bare LID
+  merely because that was used to place the offer. A primary device can appear
+  as `Device=0`, so its preaccept remains a valid target. An incoming direct call latches the first
   control's sender and creator even if it arrives just before `Answer`, then
   emits exactly one deferred accept to that same device. This lets two library
   endpoints complete the ordinary 1:1 handshake. Failed initial mute sends
