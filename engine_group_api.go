@@ -66,9 +66,8 @@ func (e *engine) placeGroupCall(
 		Capability: append([]byte(nil), signaling.CapabilityOffer...),
 	}
 	e.mu.Unlock()
-	if err = e.transmitCallNode(ctx, node); err != nil {
-		e.finishCall(callID, "offer_failed")
-		return nil, fmt.Errorf("meowcaller: send group offer: %w", err)
+	if err = e.publishOutgoingGroupCall(ctx, node, callID, call, opts.OnPreparing); err != nil {
+		return nil, err
 	}
 	e.c.log.Info().
 		Str("call_id", callID).
@@ -76,6 +75,42 @@ func (e *engine) placeGroupCall(
 		Bool("video", opts.Video).
 		Msg("group offer sent")
 	return call, nil
+}
+
+func (e *engine) publishOutgoingGroupCall(
+	ctx context.Context,
+	node waBinary.Node,
+	callID string,
+	call *Call,
+	prepare func(string) error,
+) error {
+	if err := e.prepareOutgoingGroupCall(callID, call, prepare); err != nil {
+		return err
+	}
+	if err := e.transmitCallNode(ctx, node); err != nil {
+		e.finishCall(callID, "offer_failed")
+		return fmt.Errorf("meowcaller: send group offer: %w", err)
+	}
+	return nil
+}
+
+// prepareOutgoingGroupCall is the lifecycle barrier between allocating an
+// outbound group CallID and publishing its offer to WhatsApp.
+func (e *engine) prepareOutgoingGroupCall(callID string, call *Call, fn func(string) error) error {
+	if fn != nil {
+		if err := fn(callID); err != nil {
+			e.finishCall(callID, "outgoing_group_preparation_failed")
+			return fmt.Errorf("meowcaller: prepare outgoing group call: %w", err)
+		}
+	}
+	e.mu.Lock()
+	current := e.calls[callID]
+	active := current != nil && current.call == call && call != nil && call.State() != CallPhaseEnded
+	e.mu.Unlock()
+	if !active {
+		return errors.New("meowcaller: outgoing group call ended during preparation")
+	}
+	return nil
 }
 
 func (e *engine) inviteParticipant(ctx context.Context, callID, target string) error {

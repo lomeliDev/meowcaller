@@ -47,6 +47,10 @@ type GroupCallOptions struct {
 	GroupJID string
 	// Video advertises an H.264 group video call.
 	Video bool
+	// OnPreparing runs after the outgoing call has a stable ID and before its
+	// offer can reach WhatsApp. It may register external media ownership for
+	// that ID; returning an error aborts the call before signaling.
+	OnPreparing func(callID string) error
 }
 
 // NewClient wraps a connected whatsmeow client and installs the call event handlers.

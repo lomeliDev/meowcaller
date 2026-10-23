@@ -7,6 +7,14 @@ All notable changes to meowcaller, tracked per module. Format loosely follows
 
 ## [Unreleased]
 
+### call/group-signaling — `implemented`
+
+- `GroupCallOptions.OnPreparing` publishes an outgoing group CallID after the
+  engine entry exists and before the offer is sent. An integration can reserve
+  its external media owner in that interval. A callback failure, or a call that
+  ends while the callback runs, removes the entry and emits no group offer.
+  The callback runs outside the engine mutex and remains nil by default.
+
 ### call/1to1-signaling — `implemented`
 
 - When a direct outgoing call receives the callee's `<accept>`, the caller now
