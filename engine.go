@@ -90,8 +90,11 @@ type engineCall struct {
 	// The callee <accept> is deferred until the caller's <mute_v2> arrives.
 	acceptPending   bool
 	acceptMuteSeen  bool
+	acceptMuteFrom  types.JID
+	acceptMuteOwner types.JID
 	initialMuteSent bool
 	initialMuteBusy bool
+	initialMutePeer types.JID
 }
 
 // pendingJoinGroupControl conserva un control de grupo mientras OnJoined
@@ -744,6 +747,9 @@ func (e *engine) answer(c *Call) error {
 	m.acceptPending = true
 	acceptNow := m.acceptMuteSeen
 	to, creator := m.from, m.creator
+	if acceptNow {
+		to, creator = m.acceptMuteFrom, m.acceptMuteOwner
+	}
 	e.mu.Unlock()
 	if acceptNow {
 		e.sendAccept(c.id, to, creator)
@@ -857,13 +863,13 @@ func (e *engine) sendInitialMute(callID string) {
 	// Source of truth: https://github.com/oxidezap/whatsapp-rust/blob/41095d4e6ba4610e054e9ede3af1d5e88a83faee/wacore/src/voip/stanza.rs#L297-L305
 	e.mu.Lock()
 	m := e.calls[callID]
-	if m == nil || m.group || m.direction != CallDirectionOutgoing || m.initialMuteSent || m.initialMuteBusy ||
+	if m == nil || m.group || m.direction != CallDirectionOutgoing || m.relay == nil || m.initialMutePeer.IsEmpty() || m.initialMuteSent || m.initialMuteBusy ||
 		m.call == nil || m.call.State() == CallPhaseEnded {
 		e.mu.Unlock()
 		return
 	}
 	m.initialMuteBusy = true
-	to, creator := m.from, m.creator
+	to, creator := m.initialMutePeer, m.creator
 	e.mu.Unlock()
 
 	node := signaling.BuildMuteV2(callID, to, creator, "0")
@@ -963,6 +969,18 @@ func (e *engine) onPreAccept(ev *events.CallPreAccept) {
 		}
 		e.mu.Unlock()
 	}
+	// The preaccept event, rather than the Device field, proves the target is
+	// ready: Whatsmeow represents a primary device as Device=0, indistinguishable
+	// from a bare JID after decoding. A preaccept can arrive after relay
+	// allocation, so it independently retries once both halves are known.
+	if !ev.From.IsEmpty() {
+		e.mu.Lock()
+		if current := e.calls[ev.CallID]; current != nil {
+			current.initialMutePeer = ev.From
+		}
+		e.mu.Unlock()
+	}
+	e.sendInitialMute(ev.CallID)
 	e.c.log.Info().
 		Str("call_id", ev.CallID).
 		Str("from", ev.From.String()).
@@ -1281,6 +1299,8 @@ func (e *engine) onCallRaw(callNode *waBinary.Node) bool {
 		pending := first && m.acceptPending
 		if first {
 			m.acceptMuteSeen = true
+			m.acceptMuteFrom = callNode.AttrGetter().JID("from")
+			m.acceptMuteOwner = mv.JID("call-creator")
 		}
 		e.mu.Unlock()
 		if m != nil && m.call != nil {
