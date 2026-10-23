@@ -71,17 +71,44 @@ type engineCall struct {
 	groupCallbacks      GroupMediaCallbacks
 	pendingGroupUpdates []GroupMediaUpdate
 	pendingGroupEpochs  []GroupMediaEpoch
-	groupRawEpoch       []byte
-	groupEpochTxID      uint32
-	hasGroupEpoch       bool
-	started             bool
-	cancel              context.CancelFunc // tears down this call's media goroutine
-	waitingRoomCancel   context.CancelFunc
-	inviteSelfDevice    groupCallDevice
-	invitePeerDevice    groupCallDevice
+	// joinHookPending cierra la carrera entre JoinCallLink y el primer snapshot
+	// de grupo: el integrador registra al dueño de medios con OnJoined fuera del
+	// mutex, mientras los controles que llegan en paralelo esperan aquí. No se
+	// puede sostener e.mu durante el hook porque el integrador puede volver al
+	// engine al preparar su ciclo de vida.
+	joinHookPending   bool
+	joinPendingGroup  []pendingJoinGroupControl
+	groupRawEpoch     []byte
+	groupEpochTxID    uint32
+	hasGroupEpoch     bool
+	started           bool
+	cancel            context.CancelFunc // tears down this call's media goroutine
+	waitingRoomCancel context.CancelFunc
+	inviteSelfDevice  groupCallDevice
+	invitePeerDevice  groupCallDevice
 
 	// The callee <accept> is deferred until the caller's <mute_v2> arrives.
 	acceptPending bool
+}
+
+// pendingJoinGroupControl conserva un control de grupo mientras OnJoined
+// registra el dueño de los medios. Es privado al engine: se vacía en orden al
+// terminar el hook o se descarta al terminar la llamada.
+type pendingJoinGroupControl struct {
+	update *groupCallUpdate
+	epoch  *GroupMediaEpoch
+}
+
+func clearPendingJoinGroupControls(m *engineCall) {
+	if m == nil {
+		return
+	}
+	for i := range m.joinPendingGroup {
+		if epoch := m.joinPendingGroup[i].epoch; epoch != nil {
+			clear(epoch.RawKey)
+		}
+	}
+	m.joinPendingGroup = nil
 }
 
 // newEngine creates the engine for a Client.
@@ -1376,6 +1403,7 @@ func (e *engine) finishCall(callID, reason string) {
 		m.waitingRoomCancel = nil
 		clear(m.groupRawEpoch)
 		m.groupRawEpoch = nil
+		clearPendingJoinGroupControls(m)
 		receivers = m.groupReceivers
 		m.groupReceivers = nil
 		call = m.call

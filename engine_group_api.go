@@ -452,6 +452,7 @@ func (e *engine) joinPublicCallLink(
 		JID: self, CapabilityVersion: 1,
 		Capability: append([]byte(nil), signaling.CapabilityOffer...),
 	}
+	m.joinHookPending = opts.OnJoined != nil
 	e.mu.Unlock()
 	if opts.OnJoined != nil {
 		if err := opts.OnJoined(call); err != nil {
@@ -462,8 +463,9 @@ func (e *engine) joinPublicCallLink(
 		}
 	}
 	if result.Group != nil {
-		e.applyGroupUpdate(*result.Group)
+		e.applyGroupUpdateFromJoin(*result.Group)
 	}
+	e.releaseCallLinkJoinHook(result.CallID)
 	if result.InWaitingRoom {
 		e.startWaitingRoomHeartbeat(result.CallID)
 	}

@@ -15,7 +15,9 @@ All notable changes to meowcaller, tracked per module. Format loosely follows
   real call ID in that interval. A hook error now tears down the just-created
   engine entry, ends the Call, and sends a terminate, so a failed handoff
   cannot leave hidden live state or an attached remote call behind. The
-  existing no-hook path is unchanged.
+  existing no-hook path is unchanged. Group snapshots and epochs that arrive
+  concurrently while the hook runs are queued, and media cannot begin until
+  the hook succeeds; a failed hook discards that queue.
 
 ### call/video — `implemented`
 

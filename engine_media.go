@@ -44,7 +44,7 @@ type videoReceiveState struct {
 func (e *engine) maybeStartMedia(callID string) {
 	e.mu.Lock()
 	m := e.calls[callID]
-	if m == nil || m.started {
+	if m == nil || m.started || m.joinHookPending {
 		e.mu.Unlock()
 		return
 	}
