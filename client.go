@@ -27,8 +27,9 @@ type Client struct {
 	mediaOffloadRekey MediaOffloadRekeyFunc
 	mediaGroupOffload MediaGroupOffloadFunc
 
-	getGroupInfo func(context.Context, types.JID) (*types.GroupInfo, error)
-	ownGroupJIDs func() []types.JID
+	getGroupInfo   func(context.Context, types.JID) (*types.GroupInfo, error)
+	getUserDevices func(context.Context, []types.JID) ([]types.JID, error)
+	ownGroupJIDs   func() []types.JID
 
 	mu             sync.Mutex
 	onIncomingCall func(*Call)
@@ -47,6 +48,11 @@ type GroupCallOptions struct {
 	GroupJID string
 	// Video advertises an H.264 group video call.
 	Video bool
+	// MediaOffload transfers media for this outgoing call only. It is recorded before
+	// the offer is transmitted, so it can run synchronously before
+	// GroupCallWithOptions returns. When nil, the client-wide
+	// WithGroupMediaOffload callback remains the default.
+	MediaOffload MediaGroupOffloadFunc
 }
 
 // NewClient wraps a connected whatsmeow client and installs the call event handlers.
@@ -58,6 +64,7 @@ func NewClient(wa *whatsmeow.Client, opts ...Option) *Client {
 		wa: wa, log: cfg.log, diag: cfg.diag, mediaOffload: cfg.mediaOffload, mediaOffloadRekey: cfg.mediaOffloadRekey,
 		mediaGroupOffload: cfg.mediaGroupOffload,
 		getGroupInfo:      wa.GetGroupInfo,
+		getUserDevices:    wa.GetUserDevices,
 		ownGroupJIDs: func() []types.JID {
 			return []types.JID{wa.Store.GetJID(), wa.Store.GetLID()}
 		},

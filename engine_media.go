@@ -99,21 +99,25 @@ func (e *engine) maybeStartMedia(callID string) {
 	selfLID, peerLID := m.selfLID, m.peerLID
 	inbound := m.direction == CallDirectionIncoming
 	isGroup := m.group
-	if isGroup && e.c != nil && e.c.mediaGroupOffload != nil {
+	groupOffload := m.groupMediaOffload
+	if groupOffload == nil && e.c != nil {
+		groupOffload = e.c.mediaGroupOffload
+	}
+	if isGroup && groupOffload != nil {
 		m.groupOffloading = true
+		m.groupMediaOffload = nil
 	}
 	video := m.localVideo || m.remoteVideo
 	e.mu.Unlock()
 
-	if isGroup && e.c != nil && e.c.mediaGroupOffload != nil {
+	if isGroup && groupOffload != nil {
 		if groupUpdate.CallID == "" {
 			clear(callKey)
 			return
 		}
 		setup := groupMediaSetupFrom(callID, selfLID, inbound, groupEpoch, callKey, groupUpdate)
-		offload := e.c.mediaGroupOffload
 		e.c.log.Info().Str("call_id", callID).Msg("handing group media to an offload target")
-		callbacks, err := offload(setup)
+		callbacks, err := groupOffload(setup)
 		clear(callKey)
 		if err == nil && (callbacks.OnGroupUpdate == nil || callbacks.OnGroupEpoch == nil) {
 			err = errors.New("meowcaller: group media offload callbacks are incomplete")

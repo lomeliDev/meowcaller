@@ -7,6 +7,15 @@ All notable changes to meowcaller, tracked per module. Format loosely follows
 
 ## [Unreleased]
 
+### media/offload — `implemented`
+
+- `GroupCallOptions.MediaOffload` binds a group-media handoff to one outgoing
+  invocation before its offer is sent. This permits a synchronous media setup
+  before `GroupCallWithOptions` returns without a concurrent outgoing call
+  receiving the wrong callback. It takes precedence over the client-wide
+  `WithGroupMediaOffload` setting for that invocation, is consumed after the
+  first setup, and is released on failed setup or call termination.
+
 ### call/1to1-signaling — `implemented`
 
 - When a direct outgoing call receives the callee's `<accept>`, the caller now

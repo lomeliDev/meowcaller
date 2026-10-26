@@ -64,6 +64,7 @@ type engineCall struct {
 	appDataTx           *appDataSender
 	rekeyPeer           func(string) error
 	group               bool
+	groupMediaOffload   MediaGroupOffloadFunc // one outgoing invocation; consumed at first setup
 	groupUpdate         *groupCallUpdate
 	groupReceivers      *participantReceiveRegistry
 	groupOffloaded      bool
@@ -1582,6 +1583,7 @@ func (e *engine) finishCall(callID, reason string) {
 		m.waitingRoomCancel = nil
 		clear(m.groupRawEpoch)
 		m.groupRawEpoch = nil
+		m.groupMediaOffload = nil
 		clearPendingJoinGroupControls(m)
 		receivers = m.groupReceivers
 		m.groupReceivers = nil
