@@ -3,13 +3,209 @@ package meowcaller
 import (
 	"bytes"
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/rs/zerolog"
+	"go.mau.fi/whatsmeow"
+	waBinary "go.mau.fi/whatsmeow/binary"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 )
+
+func TestOutgoingGroupInvocationOffloadIsSynchronousAndDoesNotCrossCalls(t *testing.T) {
+	setup := testGroupMediaSetup(t)
+	globalCalls := 0
+	self := types.NewJID("100", types.HiddenUserServer)
+	c := &Client{wa: &whatsmeow.Client{Store: &store.Device{LID: self}}, log: zerolog.Nop(), mediaGroupOffload: func(GroupMediaSetup) (GroupMediaCallbacks, error) {
+		globalCalls++
+		return GroupMediaCallbacks{}, errors.New("global callback must not receive an invocation callback")
+	}}
+	c.getUserDevices = func(_ context.Context, users []types.JID) ([]types.JID, error) {
+		devices := make([]types.JID, 0, len(users))
+		for _, user := range users {
+			if user.ToNonAD() != self.ToNonAD() {
+				devices = append(devices, types.NewADJID(user.User, types.LIDDomain, 1))
+			}
+		}
+		return devices, nil
+	}
+	e := newEngine(c)
+	c.eng = e
+
+	var mu sync.Mutex
+	got := make(map[string]string)
+	expectedByCall := make(map[string]string)
+	var crossed string
+	expectedByPeer := map[string]string{
+		"200@lid": "outbound-a",
+		"300@lid": "outbound-b",
+	}
+	e.sendCallNode = func(_ context.Context, node waBinary.Node) error {
+		callID := node.AttrGetter().JID("to").User
+		e.mu.Lock()
+		m := e.calls[callID]
+		peer := ""
+		if m != nil {
+			peer = m.peerLID
+		}
+		e.mu.Unlock()
+		mu.Lock()
+		expectedByCall[callID] = expectedByPeer[peer]
+		mu.Unlock()
+		update, err := groupUpdateFromMediaSetup(GroupMediaSetup{
+			CallID: callID, SelfLID: self.String(), Epoch: setup.Epoch,
+			Roster: setup.Roster, Relay: setup.Relay,
+		})
+		if err != nil {
+			return err
+		}
+		if !e.applyGroupUpdate(update) {
+			return errors.New("group update was not accepted")
+		}
+		return e.installGroupEpoch(callID, setup.Epoch.TransactionID, setup.Epoch.RawKey)
+	}
+
+	errCh := make(chan error, 2)
+	var wg sync.WaitGroup
+	for _, label := range []string{"outbound-a", "outbound-b"} {
+		label := label
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			targets := []string{"200@lid", "201@lid"}
+			if label == "outbound-b" {
+				targets = []string{"300@lid", "301@lid"}
+			}
+			_, err := e.placeGroupCall(context.Background(), targets, GroupCallOptions{
+				MediaOffload: func(received GroupMediaSetup) (GroupMediaCallbacks, error) {
+					mu.Lock()
+					got[label] = received.CallID
+					if expectedByCall[received.CallID] != label {
+						crossed = received.CallID
+					}
+					mu.Unlock()
+					return GroupMediaCallbacks{
+						OnGroupUpdate: func(GroupMediaUpdate) error { return nil },
+						OnGroupEpoch:  func(uint32, []byte) error { return nil },
+					}, nil
+				},
+			})
+			errCh <- err
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("placeGroupCall: %v", err)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if got["outbound-a"] == "" || got["outbound-b"] == "" || got["outbound-a"] == got["outbound-b"] {
+		t.Fatalf("per-invocation handoff crossed calls: %#v", got)
+	}
+	if crossed != "" {
+		t.Fatalf("callback received the other invocation's setup for %s", crossed)
+	}
+	if globalCalls != 0 {
+		t.Fatalf("client-wide callback calls = %d, want 0", globalCalls)
+	}
+	for _, callID := range got {
+		m := e.calls[callID]
+		if !m.groupOffloaded || m.groupOffloading || m.groupMediaOffload != nil {
+			t.Fatalf("%s handoff state = offloaded:%t offloading:%t callback:%p", callID,
+				m.groupOffloaded, m.groupOffloading, m.groupMediaOffload)
+		}
+	}
+}
+
+func TestOutgoingGroupInvocationOffloadFallsBackToClientCallback(t *testing.T) {
+	setup := testGroupMediaSetup(t)
+	self := types.NewJID("100", types.HiddenUserServer)
+	globalCalls := 0
+	c := &Client{wa: &whatsmeow.Client{Store: &store.Device{LID: self}}, log: zerolog.Nop(), mediaGroupOffload: func(received GroupMediaSetup) (GroupMediaCallbacks, error) {
+		globalCalls++
+		return GroupMediaCallbacks{
+			OnGroupUpdate: func(GroupMediaUpdate) error { return nil },
+			OnGroupEpoch:  func(uint32, []byte) error { return nil },
+		}, nil
+	}}
+	c.getUserDevices = func(_ context.Context, users []types.JID) ([]types.JID, error) {
+		devices := make([]types.JID, 0, len(users))
+		for _, user := range users {
+			if user.ToNonAD() != self.ToNonAD() {
+				devices = append(devices, types.NewADJID(user.User, types.LIDDomain, 1))
+			}
+		}
+		return devices, nil
+	}
+	e := newEngine(c)
+	c.eng = e
+	e.sendCallNode = func(_ context.Context, node waBinary.Node) error {
+		callID := node.AttrGetter().JID("to").User
+		update, err := groupUpdateFromMediaSetup(GroupMediaSetup{
+			CallID: callID, SelfLID: self.String(), Epoch: setup.Epoch,
+			Roster: setup.Roster, Relay: setup.Relay,
+		})
+		if err != nil {
+			return err
+		}
+		if !e.applyGroupUpdate(update) {
+			return errors.New("group update was not accepted")
+		}
+		return e.installGroupEpoch(callID, setup.Epoch.TransactionID, setup.Epoch.RawKey)
+	}
+
+	call, err := e.placeGroupCall(context.Background(), []string{"200@lid", "201@lid"}, GroupCallOptions{})
+	if err != nil {
+		t.Fatalf("placeGroupCall: %v", err)
+	}
+	if globalCalls != 1 {
+		t.Fatalf("client-wide callback calls = %d, want 1", globalCalls)
+	}
+	e.mu.Lock()
+	m := e.calls[call.ID()]
+	e.mu.Unlock()
+	if m == nil || !m.groupOffloaded || m.groupOffloading || m.groupMediaOffload != nil {
+		t.Fatalf("fallback state = %#v", m)
+	}
+}
+
+func TestOutgoingGroupInvocationOffloadReleasesCallbackOnErrorAndCancellation(t *testing.T) {
+	setup := testGroupMediaSetup(t)
+	update, err := groupUpdateFromMediaSetup(setup)
+	if err != nil {
+		t.Fatalf("groupUpdateFromMediaSetup: %v", err)
+	}
+	c := &Client{log: zerolog.Nop()}
+	e := newEngine(c)
+	c.eng = e
+	callbackErr := errors.New("worker setup failed")
+	e.calls[setup.CallID] = &engineCall{
+		call: &Call{eng: e, id: setup.CallID}, selfLID: setup.SelfLID,
+		group: true, groupUpdate: &update, groupRawEpoch: bytes.Clone(setup.Epoch.RawKey),
+		groupEpochTxID: setup.Epoch.TransactionID, hasGroupEpoch: true,
+		groupMediaOffload: func(GroupMediaSetup) (GroupMediaCallbacks, error) {
+			return GroupMediaCallbacks{}, callbackErr
+		},
+	}
+
+	e.maybeStartMedia(setup.CallID)
+	m := e.calls[setup.CallID]
+	if m.groupOffloaded || m.groupOffloading || m.groupMediaOffload != nil {
+		t.Fatalf("failed setup retained invocation callback: offloaded:%t offloading:%t callback:%p",
+			m.groupOffloaded, m.groupOffloading, m.groupMediaOffload)
+	}
+	e.finishCall(setup.CallID, "cancelled")
+	if _, remains := e.calls[setup.CallID]; remains {
+		t.Fatal("cancelled group call retained engine state")
+	}
+}
 
 func sampleRelayData(t *testing.T) *relayData {
 	t.Helper()

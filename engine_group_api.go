@@ -59,6 +59,7 @@ func (e *engine) placeGroupCall(
 	m.from = types.NewJID(callID, "call")
 	m.direction = CallDirectionOutgoing
 	m.group = true
+	m.groupMediaOffload = opts.MediaOffload
 	m.localVideo = opts.Video
 	m.remoteVideo = opts.Video
 	m.inviteSelfDevice = groupCallDevice{
@@ -293,7 +294,7 @@ func (e *engine) discoverGroupParticipants(
 	users []types.JID,
 ) ([]signaling.GroupCallParticipant, error) {
 	// Source of truth: https://github.com/purpshell/meowcaller/blob/7cb6045001dafd2514f53e85cd8c3e419c13adbe/datasheets/voip-initial-group-call.md#L63-L101
-	devices, err := e.c.wa.GetUserDevices(ctx, users)
+	devices, err := e.groupUserDevices(ctx, users)
 	if err != nil {
 		return nil, fmt.Errorf("meowcaller: group device discovery: %w", err)
 	}
@@ -323,6 +324,19 @@ func (e *engine) discoverGroupParticipants(
 		participants = append(participants, participant)
 	}
 	return participants, nil
+}
+
+func (e *engine) groupUserDevices(ctx context.Context, users []types.JID) ([]types.JID, error) {
+	if e == nil || e.c == nil {
+		return nil, errors.New("meowcaller: group device discovery is unavailable")
+	}
+	if e.c.getUserDevices != nil {
+		return e.c.getUserDevices(ctx, users)
+	}
+	if e.c.wa == nil {
+		return nil, errors.New("meowcaller: group device discovery is unavailable")
+	}
+	return e.c.wa.GetUserDevices(ctx, users)
 }
 
 func parseOptionalGroupJID(raw string) (types.JID, error) {
