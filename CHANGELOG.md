@@ -9,6 +9,15 @@ All notable changes to meowcaller, tracked per module. Format loosely follows
 
 ### signaling/group — `implemented`
 
+- `Call.Answer` mirrors the offer when accepting an active group invitation: a
+  group offer that advertises video is answered with the H.264 `<video>` child,
+  which is the field the server reports as missing (`accept-ack
+  error_code=431`) when the accept is audio-only. `AnswerWithVideo(false)`
+  remains the explicit audio-only decline and `AnswerWithVideo(true)` forces the
+  video child; a direct call still decides its deferred accept from the call's
+  local/peer video state. The exact XML of both group accepts and the
+  call-state rule are pinned by tests.
+
 - `BuildActiveGroupAccept` takes an optional trailing `video` flag and
   `Call.AnswerWithVideo` propagates it, so a group call can be accepted with the
   same H.264 `<video>` child the 1:1 accept uses. The default is unchanged:

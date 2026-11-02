@@ -108,6 +108,40 @@ func TestActiveGroupAcceptVideoOption(t *testing.T) {
 	}
 }
 
+// TestActiveGroupAcceptVideoStanzaXML pins the exact active-call accept envelope. The
+// video variant is the answer to a group offer that advertised video; its <video> child
+// is the same one the working 1:1 accept carries, because the server answers the
+// audio-only accept for such an offer with accept-ack 431.
+func TestActiveGroupAcceptVideoStanzaXML(t *testing.T) {
+	creator := types.JID{User: "100001", Server: types.HiddenUserServer, Device: 1}
+	for _, tc := range []struct {
+		name  string
+		video []bool
+		want  string
+	}{
+		{
+			name: "audio-only offer",
+			want: `<call id="ACCEPT" to="CID@call"><accept call-creator="100001:1@lid" call-id="CID">` +
+				`<audio enc="opus" rate="16000"/><net medium="2"/><encopt keygen="2"/></accept></call>`,
+		},
+		{
+			name:  "video offer",
+			video: []bool{true},
+			want: `<call id="ACCEPT" to="CID@call"><accept call-creator="100001:1@lid" call-id="CID">` +
+				`<audio enc="opus" rate="16000"/><video dec="H264" device_orientation="0"/>` +
+				`<net medium="2"/><encopt keygen="2"/></accept></call>`,
+		},
+	} {
+		accept, err := BuildActiveGroupAccept("CID", creator, "ACCEPT", tc.video...)
+		if err != nil {
+			t.Fatalf("%s: BuildActiveGroupAccept: %v", tc.name, err)
+		}
+		if got := accept.String(); got != tc.want {
+			t.Fatalf("%s: accept XML =\n%s\nwant\n%s", tc.name, got, tc.want)
+		}
+	}
+}
+
 func TestParseActiveGroupInviteSnapshot(t *testing.T) {
 	creator := types.JID{User: "100001", Server: types.HiddenUserServer, Device: 1}
 	user := types.NewJID("200002", types.HiddenUserServer)

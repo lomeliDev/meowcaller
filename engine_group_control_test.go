@@ -64,15 +64,22 @@ func TestGroupAnswerSendsImmediateCallScopedAccept(t *testing.T) {
 
 func TestGroupAnswerVideoOptionControlsAcceptChildren(t *testing.T) {
 	for _, tc := range []struct {
-		name      string
-		answer    func(*Call) error
-		wantVideo bool
+		name         string
+		offeredVideo bool
+		answer       func(*Call) error
+		wantVideo    bool
 	}{
-		{name: "audio-only default", answer: func(call *Call) error { return call.Answer() }},
+		{name: "audio-only offer default", answer: func(call *Call) error { return call.Answer() }},
+		// A video group offer must be answered with the H.264 <video> child: the
+		// audio-only accept for such an offer comes back as accept-ack 431.
+		{name: "video offer default", offeredVideo: true, answer: func(call *Call) error { return call.Answer() }, wantVideo: true},
+		{name: "video offer explicit decline", offeredVideo: true, answer: func(call *Call) error { return call.AnswerWithVideo(false) }},
 		{name: "video", answer: func(call *Call) error { return call.AnswerWithVideo(true) }, wantVideo: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			eng, call, _ := testGroupEngine("GROUP")
+			eng.calls["GROUP"].localVideo = tc.offeredVideo
+			eng.calls["GROUP"].remoteVideo = tc.offeredVideo
 			var sent waBinary.Node
 			eng.sendCallNode = func(_ context.Context, node waBinary.Node) error {
 				sent = node
