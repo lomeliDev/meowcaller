@@ -161,7 +161,9 @@ func BuildActiveGroupPreaccept(
 }
 
 // BuildActiveGroupAccept builds the immediate acceptance of an active-call invite.
-func BuildActiveGroupAccept(callID string, callCreator types.JID, requestID string) (waBinary.Node, error) {
+// The optional video flag advertises H.264 in a <video> child; it defaults to false,
+// which keeps the audio-only accept. Only the first value is used.
+func BuildActiveGroupAccept(callID string, callCreator types.JID, requestID string, video ...bool) (waBinary.Node, error) {
 	// Source of truth: https://github.com/purpshell/meowcaller/blob/676ebee3eca513b5348fab36cae5c560cc791238/datasheets/voip-group-invite-accept.md#L26-L45
 	if callID == "" || callCreator.IsEmpty() || requestID == "" {
 		return waBinary.Node{}, fmt.Errorf("signaling: build active group accept: incomplete identity")
@@ -171,6 +173,7 @@ func BuildActiveGroupAccept(callID string, callCreator types.JID, requestID stri
 		To:          types.NewJID(callID, "call"),
 		CallCreator: callCreator,
 		AudioRates:  []string{"16000"},
+		Video:       len(video) > 0 && video[0],
 	})
 	accept.Attrs["id"] = requestID
 	return accept, nil

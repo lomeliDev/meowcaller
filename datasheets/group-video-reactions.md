@@ -120,11 +120,17 @@ type ParticipantVideoFrame struct {
 }
 
 func (c *Call) OnParticipantVideoFrame(func(ParticipantVideoFrame))
+func (c *Call) AnswerWithVideo(video bool) error
 ```
 
 The existing `ReceiveVideo` sink remains source-compatible and continues receiving
 all access units. The participant callback is the group-aware surface and receives
 an owned copy so callers cannot retain or mutate the media loop's buffer.
+
+`AnswerWithVideo` is additive to the captured contract: `Answer` keeps the
+audio-only group accept seen in the capture, while `video=true` adds the H.264
+`<video>` child described above. The flag is ignored for direct calls, where the
+call's local/peer video state already decides the accept.
 
 ## Web example target
 

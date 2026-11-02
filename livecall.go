@@ -281,9 +281,16 @@ func (c *Call) IsReceivingVideo() bool {
 	return c.eng.callIsReceivingVideo(c.id)
 }
 
-// Answer accepts an inbound call (preaccept + accept) and brings media up. No-op error
+// Answer accepts an inbound call (preaccept + accept) and brings media up. A group
+// call is accepted audio-only; use AnswerWithVideo to advertise video. No-op error
 // if the call is not in a ringing state.
-func (c *Call) Answer() error { return c.eng.answer(c) }
+func (c *Call) Answer() error { return c.eng.answer(c, false) }
+
+// AnswerWithVideo accepts an inbound call like Answer. For a group call video selects
+// whether the accept advertises H.264: true includes the <video> child, false keeps
+// the audio-only accept. For a direct call the flag is ignored; there the call's
+// existing local and peer video state decides the accept.
+func (c *Call) AnswerWithVideo(video bool) error { return c.eng.answer(c, video) }
 
 // Reject declines an inbound call.
 func (c *Call) Reject() error { return c.eng.reject(c) }
