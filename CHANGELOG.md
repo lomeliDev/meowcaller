@@ -9,6 +9,12 @@ All notable changes to meowcaller, tracked per module. Format loosely follows
 
 ### media/offload — `implemented`
 
+- `GroupRelaySetup.TransactionID` preserves the authoritative relay transaction
+  across both offload conversions. A renewed roster now refreshes the relay
+  allocation and its participant subscriptions instead of being discarded as
+  transaction zero; the two-participant regression test verifies the renewed
+  receive registry and allocate packet.
+
 - `GroupCallOptions.MediaOffload` binds a group-media handoff to one outgoing
   invocation before its offer is sent. This permits a synchronous media setup
   before `GroupCallWithOptions` returns without a concurrent outgoing call
