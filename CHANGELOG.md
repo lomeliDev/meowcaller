@@ -7,6 +7,16 @@ All notable changes to meowcaller, tracked per module. Format loosely follows
 
 ## [Unreleased]
 
+### media/group-audio-level — `implemented`
+
+- `Call.OnParticipantAudioLevel` reports the RMS level of every decoded inbound
+  audio frame together with the sending participant's canonical identity, for
+  speaking detection in group calls. It is additive to `Call.Receive` and nil by
+  default: with no callback registered the media loop computes the same level it
+  already emitted to diagnostics and behaves exactly as before. Focused dispatch
+  and RMS tests pass with a doubled decoded frame; live group loudness remains
+  unvalidated.
+
 ### media/offload — `implemented`
 
 - `GroupRelaySetup.TransactionID` preserves the authoritative relay transaction

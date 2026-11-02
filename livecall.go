@@ -31,6 +31,7 @@ type Call struct {
 	onVideoState              func(VideoState)
 	onVideoKeyframeRequest    func()
 	onParticipantVideoFrame   func(ParticipantVideoFrame)
+	onParticipantAudioLevel   func(ParticipantAudioLevel)
 	onReaction                func(CallReaction)
 	groupState                *GroupCallState
 	onGroupState              func(GroupCallState)
@@ -71,6 +72,14 @@ type GroupCallDevice struct {
 	Platform string
 	PID      uint32
 	HasPID   bool
+}
+
+// ParticipantAudioLevel is the root-mean-square level of one decoded inbound audio
+// frame, attributed to the participant that sent it. RMS uses the PCM sample scale
+// (0 is silence, 1 is full scale).
+type ParticipantAudioLevel struct {
+	ParticipantID string
+	RMS           float64
 }
 
 // CallReaction is a transient emoji reaction received over the call's RTC app-data stream.
@@ -637,6 +646,27 @@ func (c *Call) dispatchParticipantVideoFrame(frame ParticipantVideoFrame) bool {
 		return false
 	}
 	fn(cloneParticipantVideoFrame(frame))
+	return true
+}
+
+// OnParticipantAudioLevel registers a callback fired for every decoded inbound audio
+// frame with its participant identity and measured RMS level, for speaking detection in
+// group calls. It is additive to Receive and nil by default. In a direct call the
+// participant ID is the peer's canonical identity.
+func (c *Call) OnParticipantAudioLevel(fn func(ParticipantAudioLevel)) {
+	c.mu.Lock()
+	c.onParticipantAudioLevel = fn
+	c.mu.Unlock()
+}
+
+func (c *Call) dispatchParticipantAudioLevel(level ParticipantAudioLevel) bool {
+	c.mu.Lock()
+	fn := c.onParticipantAudioLevel
+	c.mu.Unlock()
+	if fn == nil {
+		return false
+	}
+	fn(level)
 	return true
 }
 
