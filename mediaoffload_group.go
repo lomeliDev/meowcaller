@@ -38,6 +38,7 @@ type GroupParticipantSetup struct {
 
 // GroupRelaySetup contains the group relay's credentials and endpoints.
 type GroupRelaySetup struct {
+	TransactionID    uint32
 	ParticipantUUID  string
 	SelfPID          uint32
 	HasSelfPID       bool
@@ -201,7 +202,8 @@ func groupCallUpdateFromMediaUpdate(callID string, update GroupMediaUpdate) (gro
 	}
 	relay := update.Relay
 	out.Relay = &groupCallRelay{
-		SelfPID: relay.SelfPID, HasSelfPID: relay.HasSelfPID,
+		TransactionID: relay.TransactionID,
+		SelfPID:       relay.SelfPID, HasSelfPID: relay.HasSelfPID,
 		ParticipantUUID: relay.ParticipantUUID, AttributePadding: relay.AttributePadding,
 		WarpMITagLength: relay.WarpMITagLength, HasWarpMITagLength: true,
 		Key: bytes.Clone(relay.KeyASCII), HBHKey: bytes.Clone(relay.HBHKey),
@@ -232,6 +234,7 @@ func groupMediaSetupFrom(callID, selfLID string, inbound bool, epoch uint32, raw
 		setup.SelfPID, setup.HasSelfPID = update.Relay.SelfPID, update.Relay.HasSelfPID
 		setup.ParticipantUUID = update.Relay.ParticipantUUID
 		setup.Relay = GroupRelaySetup{
+			TransactionID:   update.Relay.TransactionID,
 			ParticipantUUID: update.Relay.ParticipantUUID,
 			SelfPID:         update.Relay.SelfPID, HasSelfPID: update.Relay.HasSelfPID,
 			KeyASCII: bytes.Clone(update.Relay.Key), HBHKey: bytes.Clone(update.Relay.HBHKey),

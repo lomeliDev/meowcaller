@@ -439,10 +439,6 @@ func (e *engine) joinPublicCallLink(
 		WaitingRoomEnabled: joined.WaitingRoomEnabled,
 		InWaitingRoom:      joined.InWaitingRoom, IsAdmin: joined.IsAdmin,
 	}
-	if joined.Group != nil {
-		update := groupCallUpdateFromSignaling(*joined.Group)
-		result.Group = &update
-	}
 	phase := CallPhaseConnecting
 	if result.InWaitingRoom {
 		phase = CallPhaseWaitingRoom
@@ -475,9 +471,6 @@ func (e *engine) joinPublicCallLink(
 			}
 			return nil, fmt.Errorf("meowcaller: prepare call-link join: %w", err)
 		}
-	}
-	if result.Group != nil {
-		e.applyGroupUpdateFromJoin(*result.Group)
 	}
 	e.releaseCallLinkJoinHook(result.CallID)
 	if result.InWaitingRoom {
