@@ -746,7 +746,7 @@ func (e *engine) answer(c *Call, groupVideo, groupVideoSet bool) error {
 		// offer because the server rejects an audio-only accept for a video group invite.
 		video := groupVideo
 		if !groupVideoSet {
-			video = m.localVideo || m.remoteVideo
+			video = e.callIsVideo(c.id)
 		}
 		accept, err := signaling.BuildActiveGroupAccept(c.id, m.creator, e.nextCallNodeID(), video)
 		if err != nil {

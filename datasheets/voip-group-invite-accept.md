@@ -7,7 +7,12 @@ state and call-scoped signaling before `preaccept`.
 **Status:** implemented; the video-bearing accept is inferred from live evidence
 and its live acceptance is pending (see "Video extension").
 
-**Reference pinned at:** capture SHA-256
+**Reference pinned at:** `UNMAPPED` — no reference body specifies this module: the
+WhatsApp-Rust reference `build_accept` carries no `<video>` child, and the active-call
+invitation shape comes from the immutable capture below rather than from a reference
+commit.
+
+**Capture SHA-256:**
 `9d6463714430c55ddb3ccb95e153f1d06d11a1feea7a153d1ea95f39f48b6889`
 
 The capture covers the audio-only invitation. WhatsApp has no published spec for

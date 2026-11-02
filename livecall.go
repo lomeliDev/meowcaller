@@ -290,8 +290,10 @@ func (c *Call) Answer() error { return c.eng.answer(c, false, false) }
 
 // AnswerWithVideo accepts an inbound call like Answer and states the group accept's video
 // preference: true advertises H.264 in the <video> child, false keeps the audio-only
-// accept (declining video explicitly). For a direct call the flag is ignored; there the
-// call's existing local and peer video state decides the accept.
+// accept (declining video explicitly). On an offer that advertised video, false emits
+// exactly the audio-only accept the server rejects with accept-ack error_code=431. For a
+// direct call the flag is ignored; there the call's existing local and peer video state
+// decides the accept.
 func (c *Call) AnswerWithVideo(video bool) error { return c.eng.answer(c, video, true) }
 
 // Reject declines an inbound call.

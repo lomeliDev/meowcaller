@@ -16,7 +16,8 @@ All notable changes to meowcaller, tracked per module. Format loosely follows
   remains the explicit audio-only decline and `AnswerWithVideo(true)` forces the
   video child; a direct call still decides its deferred accept from the call's
   local/peer video state. The exact XML of both group accepts and the
-  call-state rule are pinned by tests.
+  call-state rule are pinned by tests. The group mirror reads the call's video
+  state under the engine lock, like every other reader of those fields.
 
 - `BuildActiveGroupAccept` takes an optional trailing `video` flag and
   `Call.AnswerWithVideo` propagates it, so a group call can be accepted with the
