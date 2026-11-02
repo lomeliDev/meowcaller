@@ -2,6 +2,7 @@ package meowcaller
 
 import (
 	"context"
+	"slices"
 	"testing"
 
 	"github.com/purpshell/meowcaller/signaling"
@@ -58,6 +59,66 @@ func TestGroupAnswerSendsImmediateCallScopedAccept(t *testing.T) {
 	}
 	if eng.calls["GROUP"].acceptPending {
 		t.Fatal("group accept was incorrectly deferred to mute_v2")
+	}
+}
+
+func TestGroupAnswerVideoOptionControlsAcceptChildren(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		answer    func(*Call) error
+		wantVideo bool
+	}{
+		{name: "audio-only default", answer: func(call *Call) error { return call.Answer() }},
+		{name: "video", answer: func(call *Call) error { return call.AnswerWithVideo(true) }, wantVideo: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			eng, call, _ := testGroupEngine("GROUP")
+			var sent waBinary.Node
+			eng.sendCallNode = func(_ context.Context, node waBinary.Node) error {
+				sent = node
+				return nil
+			}
+			if err := tc.answer(call); err != nil {
+				t.Fatalf("answer: %v", err)
+			}
+			children := sent.GetChildren()
+			if len(children) != 1 || children[0].Tag != "accept" {
+				t.Fatalf("accept envelope = %#v", sent)
+			}
+			var tags []string
+			for _, child := range children[0].GetChildren() {
+				tags = append(tags, child.Tag)
+			}
+			want := []string{"audio", "net", "encopt"}
+			if tc.wantVideo {
+				want = []string{"audio", "video", "net", "encopt"}
+			}
+			if !slices.Equal(tags, want) {
+				t.Fatalf("accept children = %v, want %v", tags, want)
+			}
+		})
+	}
+}
+
+func TestDirectAnswerWithVideoKeepsDeferredAcceptAndCallState(t *testing.T) {
+	eng, call, _ := testGroupEngine("GROUP")
+	eng.calls["GROUP"].group = false
+	var sent []waBinary.Node
+	eng.sendCallNode = func(_ context.Context, node waBinary.Node) error {
+		sent = append(sent, node)
+		return nil
+	}
+	if err := call.AnswerWithVideo(true); err != nil {
+		t.Fatalf("AnswerWithVideo: %v", err)
+	}
+	if len(sent) != 0 {
+		t.Fatalf("direct accept was sent immediately: %#v", sent)
+	}
+	if !eng.calls["GROUP"].acceptPending {
+		t.Fatal("direct accept was not deferred to mute_v2")
+	}
+	if eng.calls["GROUP"].localVideo || eng.calls["GROUP"].remoteVideo {
+		t.Fatal("AnswerWithVideo changed the direct call's video state")
 	}
 }
 

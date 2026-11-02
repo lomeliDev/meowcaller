@@ -80,6 +80,34 @@ func TestActiveGroupInviteResponsesUseCallScope(t *testing.T) {
 	}
 }
 
+func TestActiveGroupAcceptVideoOption(t *testing.T) {
+	creator := types.JID{User: "100001", Server: types.HiddenUserServer, Device: 1}
+	for _, tc := range []struct {
+		name  string
+		video []bool
+		want  []string
+	}{
+		{name: "default", want: []string{"audio", "net", "encopt"}},
+		{name: "explicit-audio", video: []bool{false}, want: []string{"audio", "net", "encopt"}},
+		{name: "video", video: []bool{true}, want: []string{"audio", "video", "net", "encopt"}},
+	} {
+		accept, err := BuildActiveGroupAccept("CID", creator, "ACCEPT", tc.video...)
+		if err != nil {
+			t.Fatalf("%s: BuildActiveGroupAccept: %v", tc.name, err)
+		}
+		if got := childTags(t, accept); !eqTags(got, tc.want) {
+			t.Fatalf("%s: accept children = %v, want %v", tc.name, got, tc.want)
+		}
+		video, hasVideo := getChild(t, contentNodes(t, accept)[0], "video")
+		if hasVideo != (len(tc.video) > 0 && tc.video[0]) {
+			t.Fatalf("%s: accept video child present = %t", tc.name, hasVideo)
+		}
+		if hasVideo && video.AttrGetter().String("dec") != VideoStateDecH264 {
+			t.Fatalf("%s: accept video dec = %q", tc.name, video.AttrGetter().String("dec"))
+		}
+	}
+}
+
 func TestParseActiveGroupInviteSnapshot(t *testing.T) {
 	creator := types.JID{User: "100001", Server: types.HiddenUserServer, Device: 1}
 	user := types.NewJID("200002", types.HiddenUserServer)

@@ -1298,10 +1298,14 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 			"event": "frame_authenticated", "ssrc": audio.SSRC, "seq": vh.SequenceNumber,
 			"participant_id": audio.ParticipantID, "pid": audio.PID, "has_pid": audio.HasPID,
 		})
+		audioLevel := participantAudioLevelFromPCM(audio.ParticipantID, audio.PCM)
 		e.c.diag.Emit("media_in", map[string]any{
 			"seq": vh.SequenceNumber, "samples": len(audio.PCM),
-			"pcm_rms": rmsFloat32(audio.PCM), "participant_id": audio.ParticipantID,
+			"pcm_rms": audioLevel.RMS, "participant_id": audioLevel.ParticipantID,
 		})
+		if call != nil {
+			call.dispatchParticipantAudioLevel(audioLevel)
+		}
 		mixedMode := groupMixing.Load()
 		playoutLocked := false
 		if !mixedMode {
@@ -1869,8 +1873,14 @@ func (vs *videoSender) send(au []byte, duration time.Duration) {
 	}
 }
 
-// rmsFloat32 returns the root-mean-square level of a PCM frame, a cheap loudness
-// metric for the media diagnostic streams (avoids inlining raw float32 PCM).
+// participantAudioLevelFromPCM builds the public per-participant level event for one
+// decoded inbound audio frame.
+func participantAudioLevelFromPCM(participantID string, pcm []float32) ParticipantAudioLevel {
+	return ParticipantAudioLevel{ParticipantID: participantID, RMS: rmsFloat32(pcm)}
+}
+
+// rmsFloat32 returns the root-mean-square level of a PCM frame in sample amplitude
+// (0 is silence, 1 is full scale).
 func rmsFloat32(f []float32) float64 {
 	if len(f) == 0 {
 		return 0
