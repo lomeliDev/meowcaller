@@ -7,6 +7,36 @@ All notable changes to meowcaller, tracked per module. Format loosely follows
 
 ## [Unreleased]
 
+### signaling/group — `implemented`
+
+- `Call.Answer` mirrors the offer when accepting an active group invitation: a
+  group offer that advertises video is answered with the H.264 `<video>` child,
+  which is the field the server reports as missing (`accept-ack
+  error_code=431`) when the accept is audio-only. `AnswerWithVideo(false)`
+  remains the explicit audio-only decline and `AnswerWithVideo(true)` forces the
+  video child; a direct call still decides its deferred accept from the call's
+  local/peer video state. The exact XML of both group accepts and the
+  call-state rule are pinned by tests. The group mirror reads the call's video
+  state under the engine lock, like every other reader of those fields.
+
+- `BuildActiveGroupAccept` takes an optional trailing `video` flag and
+  `Call.AnswerWithVideo` propagates it, so a group call can be accepted with the
+  same H.264 `<video>` child the 1:1 accept uses. The default is unchanged:
+  `Call.Answer` and callers that omit the flag keep the captured audio-only
+  active-group accept. For a direct call the flag is ignored and the existing
+  local/peer video state still decides the deferred accept. Builder and
+  call-state tests cover both exact child sets.
+
+### media/group-audio-level — `implemented`
+
+- `Call.OnParticipantAudioLevel` reports the RMS level of every decoded inbound
+  audio frame together with the sending participant's canonical identity, for
+  speaking detection in group calls. It is additive to `Call.Receive` and nil by
+  default: with no callback registered the media loop computes the same level it
+  already emitted to diagnostics and behaves exactly as before. Focused dispatch
+  and RMS tests pass with a doubled decoded frame; live group loudness remains
+  unvalidated.
+
 ### media/offload — `implemented`
 
 - `GroupRelaySetup.TransactionID` preserves the authoritative relay transaction

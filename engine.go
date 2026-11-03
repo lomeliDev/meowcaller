@@ -730,15 +730,25 @@ func (e *engine) sendPreaccept(callID string, to, creator types.JID, video bool)
 // answer accepts an inbound call: it marks the call to accept (the actual <accept> is
 // deferred until the caller's <mute_v2>, which onCallRaw fires) and brings media up. The
 // <preaccept> was already sent eagerly when the offer arrived, so Answer only commits to
-// the call. Media comes up once callKey+relay are both known.
-func (e *engine) answer(c *Call) error {
+// the call. Media comes up once callKey+relay are both known. For a group call the immediate
+// accept mirrors the offer's video unless the caller states a preference (groupVideoSet): a
+// video group offer answered with the audio-only accept comes back as accept-ack 431, which
+// is why the mirror is the default. A direct accept follows the call's video state.
+func (e *engine) answer(c *Call, groupVideo, groupVideoSet bool) error {
 	m := e.lookup(c.id)
 	if m == nil {
 		return fmt.Errorf("meowcaller: unknown call %s", c.id)
 	}
 	if m.group {
 		// Source of truth: https://github.com/purpshell/meowcaller/blob/676ebee3eca513b5348fab36cae5c560cc791238/datasheets/voip-group-invite-accept.md#L26-L45
-		accept, err := signaling.BuildActiveGroupAccept(c.id, m.creator, e.nextCallNodeID())
+		// ASSUMPTION: the accept's <video> only advertises the H.264 decoder; the call's
+		// media gating still comes from the offer and the relay roster. Answer mirrors the
+		// offer because the server rejects an audio-only accept for a video group invite.
+		video := groupVideo
+		if !groupVideoSet {
+			video = e.callIsVideo(c.id)
+		}
+		accept, err := signaling.BuildActiveGroupAccept(c.id, m.creator, e.nextCallNodeID(), video)
 		if err != nil {
 			return err
 		}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"math"
 	"testing"
 
 	"go.mau.fi/whatsmeow"
@@ -179,6 +180,30 @@ func TestParticipantVideoFrameCallbackOwnsAccessUnit(t *testing.T) {
 	if got.ParticipantID != want.ParticipantID || got.Device != want.Device ||
 		got.PID != want.PID || got.SSRC != want.SSRC {
 		t.Fatalf("participant frame metadata = %#v, want %#v", got, want)
+	}
+}
+
+func TestParticipantAudioLevelCallbackReportsDecodedFrameRMS(t *testing.T) {
+	call := &Call{}
+	var levels []ParticipantAudioLevel
+	call.OnParticipantAudioLevel(func(level ParticipantAudioLevel) {
+		levels = append(levels, level)
+	})
+	participantID := "300:4@lid"
+	if !call.dispatchParticipantAudioLevel(participantAudioLevelFromPCM(participantID, constantPCM(320, 0.5))) {
+		t.Fatal("participant audio-level callback was not dispatched")
+	}
+	if len(levels) != 1 || levels[0].ParticipantID != participantID {
+		t.Fatalf("audio-level events = %#v", levels)
+	}
+	if math.Abs(levels[0].RMS-0.5) > 1e-9 {
+		t.Fatalf("audio-level RMS = %v, want 0.5", levels[0].RMS)
+	}
+	if silent := participantAudioLevelFromPCM(participantID, constantPCM(320, 0)); silent.RMS != 0 {
+		t.Fatalf("silent audio-level RMS = %v, want 0", silent.RMS)
+	}
+	if (&Call{}).dispatchParticipantAudioLevel(ParticipantAudioLevel{ParticipantID: participantID}) {
+		t.Fatal("audio-level dispatch without a callback reported delivery")
 	}
 }
 

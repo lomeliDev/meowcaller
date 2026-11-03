@@ -31,6 +31,7 @@ type Call struct {
 	onVideoState              func(VideoState)
 	onVideoKeyframeRequest    func()
 	onParticipantVideoFrame   func(ParticipantVideoFrame)
+	onParticipantAudioLevel   func(ParticipantAudioLevel)
 	onReaction                func(CallReaction)
 	groupState                *GroupCallState
 	onGroupState              func(GroupCallState)
@@ -71,6 +72,14 @@ type GroupCallDevice struct {
 	Platform string
 	PID      uint32
 	HasPID   bool
+}
+
+// ParticipantAudioLevel is the root-mean-square level of one decoded inbound audio
+// frame, attributed to the participant that sent it. RMS uses the PCM sample scale
+// (0 is silence, 1 is full scale).
+type ParticipantAudioLevel struct {
+	ParticipantID string
+	RMS           float64
 }
 
 // CallReaction is a transient emoji reaction received over the call's RTC app-data stream.
@@ -272,9 +281,20 @@ func (c *Call) IsReceivingVideo() bool {
 	return c.eng.callIsReceivingVideo(c.id)
 }
 
-// Answer accepts an inbound call (preaccept + accept) and brings media up. No-op error
-// if the call is not in a ringing state.
-func (c *Call) Answer() error { return c.eng.answer(c) }
+// Answer accepts an inbound call (preaccept + accept) and brings media up. A group call
+// mirrors the offer: a video group offer is accepted with the H.264 <video> child, which
+// the server requires for an active-call invite that advertises video; use
+// AnswerWithVideo(false) to decline video explicitly. No-op error if the call is not in a
+// ringing state.
+func (c *Call) Answer() error { return c.eng.answer(c, false, false) }
+
+// AnswerWithVideo accepts an inbound call like Answer and states the group accept's video
+// preference: true advertises H.264 in the <video> child, false keeps the audio-only
+// accept (declining video explicitly). On an offer that advertised video, false emits
+// exactly the audio-only accept the server rejects with accept-ack error_code=431. For a
+// direct call the flag is ignored; there the call's existing local and peer video state
+// decides the accept.
+func (c *Call) AnswerWithVideo(video bool) error { return c.eng.answer(c, video, true) }
 
 // Reject declines an inbound call.
 func (c *Call) Reject() error { return c.eng.reject(c) }
@@ -637,6 +657,27 @@ func (c *Call) dispatchParticipantVideoFrame(frame ParticipantVideoFrame) bool {
 		return false
 	}
 	fn(cloneParticipantVideoFrame(frame))
+	return true
+}
+
+// OnParticipantAudioLevel registers a callback fired for every decoded inbound audio
+// frame with its participant identity and measured RMS level, for speaking detection in
+// group calls. It is additive to Receive and nil by default. In a direct call the
+// participant ID is the peer's canonical identity.
+func (c *Call) OnParticipantAudioLevel(fn func(ParticipantAudioLevel)) {
+	c.mu.Lock()
+	c.onParticipantAudioLevel = fn
+	c.mu.Unlock()
+}
+
+func (c *Call) dispatchParticipantAudioLevel(level ParticipantAudioLevel) bool {
+	c.mu.Lock()
+	fn := c.onParticipantAudioLevel
+	c.mu.Unlock()
+	if fn == nil {
+		return false
+	}
+	fn(level)
 	return true
 }
 
