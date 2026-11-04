@@ -7,6 +7,19 @@ All notable changes to meowcaller, tracked per module. Format loosely follows
 
 ## [Unreleased]
 
+### call/video — `implemented`
+
+- `Call.RejectVideo` declines a pending peer video upgrade explicitly, the
+  outbound twin of the `VideoStateUpgradeReject` the engine already handles
+  inbound. It emits one bare `<video state="5">` stanza — no decoder
+  advertisement, no orientation — mirroring how the accept answers the same
+  request. Like `AcceptVideo` it requires the peer's upgrade to be pending and
+  consumes it, rolls the flag back when the transmit fails, and never touches
+  the local video flow: declining the peer's camera is not turning off this
+  client's. Without it the peer's request simply goes unanswered until the peer
+  cancels it. Fixture tests pin the stanza, the guard and the rollback; the
+  live receipt on a real phone remains unvalidated.
+
 ### signaling/group — `implemented`
 
 - `Call.Answer` mirrors the offer when accepting an active group invitation: a

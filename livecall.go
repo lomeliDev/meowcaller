@@ -314,6 +314,12 @@ func (c *Call) AcceptVideo() error {
 	return c.eng.transitionVideo(c.id, signaling.VideoStateUpgradeAccept)
 }
 
+// RejectVideo declines a pending peer video upgrade without changing this client's
+// independent outbound video state. It fails when no peer upgrade is pending.
+func (c *Call) RejectVideo() error {
+	return c.eng.transitionVideo(c.id, signaling.VideoStateUpgradeReject)
+}
+
 // StopVideo stops this client's outbound video while preserving peer video and audio.
 func (c *Call) StopVideo() error {
 	return c.eng.transitionVideo(c.id, signaling.VideoStateStopped)
